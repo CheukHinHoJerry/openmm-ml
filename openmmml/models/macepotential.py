@@ -162,6 +162,7 @@ class MACEPotentialImpl(MLPotentialImpl):
             'mace-omol-0-extra-large': (mace_omol, 'extra_large', True)
         }
         device = self._getTorchDevice(args)
+        print(f"====== Running MACE potential on device: {device} =======")
         if self.name in models:
             fn, name, warn = models[self.name]
             model = fn(model=name, device=device, return_raw_model=True).to(device)
@@ -171,6 +172,8 @@ class MACEPotentialImpl(MLPotentialImpl):
         elif self.name == "mace":
             if self.modelPath is not None:
                 model = torch.load(self.modelPath, map_location=device)
+                if hasattr(model, "to"):
+                    model = model.to(device)
             else:
                 raise ValueError("No modelPath provided for local MACE model.")
         else:
@@ -199,9 +202,15 @@ class MACEPotentialImpl(MLPotentialImpl):
 
         # One hot encoding of atomic numbers
 
+        model_device = device
+        try:
+            model_device = next(model.parameters()).device
+        except (AttributeError, StopIteration):
+            pass
+
         zTable = utils.AtomicNumberTable([int(z) for z in model.atomic_numbers])
         nodeAttrs = to_one_hot(
-            torch.tensor(atomic_numbers_to_indices(atomicNumbers, z_table=zTable), dtype=torch.long, device=device).unsqueeze(-1),
+            torch.tensor(atomic_numbers_to_indices(atomicNumbers, z_table=zTable), dtype=torch.long, device=model_device).unsqueeze(-1),
             num_classes=len(zTable))
 
         if atoms is None:
@@ -214,22 +223,28 @@ class MACEPotentialImpl(MLPotentialImpl):
 
         compute = partial(_computeMACE,
                           model=model,
-                          ptr=torch.tensor([0, nodeAttrs.shape[0]], dtype=torch.long, device=device, requires_grad=False),
+                          ptr=torch.tensor([0, nodeAttrs.shape[0]], dtype=torch.long, device=model_device, requires_grad=False),
                           node_attrs=nodeAttrs.to(dtype),
-                          batch=torch.zeros(nodeAttrs.shape[0], dtype=torch.long, device=device, requires_grad=False),
-                          pbc=torch.tensor([periodic, periodic, periodic], dtype=torch.bool, device=device, requires_grad=False),
+                          batch=torch.zeros(nodeAttrs.shape[0], dtype=torch.long, device=model_device, requires_grad=False),
+                          pbc=torch.tensor([periodic, periodic, periodic], dtype=torch.bool, device=model_device, requires_grad=False),
                           returnEnergyType=returnEnergyType,
-                          charge=torch.tensor([float(args.get('charge', 0))], dtype=dtype, device=device, requires_grad=False),
-                          multiplicity=torch.tensor([float(args.get('multiplicity', 1))], dtype=dtype, device=device, requires_grad=False),
+                          charge=torch.tensor([float(args.get('charge', 0))], dtype=dtype, device=model_device, requires_grad=False),
+                          multiplicity=torch.tensor([float(args.get('multiplicity', 1))], dtype=dtype, device=model_device, requires_grad=False),
                           indices=indices,
                           periodic=periodic)
-        force = openmm.PythonForce(compute)
+        PythonForce = getattr(openmm, "PythonForce", None)
+        if PythonForce is None:
+            PythonForce = getattr(getattr(openmm, "openmm", None), "PythonForce", None)
+        if PythonForce is None:
+            raise RuntimeError("PythonForce is not available in this OpenMM build.")
+        force = PythonForce(compute)
         force.setForceGroup(forceGroup)
         force.setUsesPeriodicBoundaryConditions(periodic)
         system.addForce(force)
 
 
 def _computeMACE(state, model, ptr, node_attrs, batch, pbc, returnEnergyType, charge, multiplicity, indices, periodic):
+    import os
     import torch
     from mace.data.neighborhood import get_neighborhood
     energyScale = 96.4853
@@ -245,6 +260,12 @@ def _computeMACE(state, model, ptr, node_attrs, batch, pbc, returnEnergyType, ch
     dtype = node_attrs.dtype
     cutoff = float(model.r_max.detach())
     edgeIndex, shifts, _, _ = get_neighborhood(positions, cutoff, [periodic, periodic, periodic], cell)
+    cell_tensor = torch.tensor(cell, dtype=dtype, device=ptr.device)
+    volume = torch.linalg.det(cell_tensor)
+    if torch.abs(volume) > 0:
+        rcell = 2 * torch.pi * torch.linalg.inv(cell_tensor.mT)
+    else:
+        rcell = torch.zeros((3, 3), dtype=dtype, device=ptr.device)
     inputDict = {
         "ptr": ptr,
         "node_attrs": node_attrs,
@@ -253,9 +274,13 @@ def _computeMACE(state, model, ptr, node_attrs, batch, pbc, returnEnergyType, ch
         "positions": torch.tensor(positions, dtype=dtype, device=ptr.device),
         "edge_index": torch.tensor(edgeIndex, dtype=torch.int64, device=ptr.device),
         "shifts": torch.tensor(shifts, dtype=dtype, device=ptr.device),
-        "cell": torch.tensor(cell, dtype=dtype, device=ptr.device),
+        "cell": cell_tensor,
+        "rcell": rcell,
+        "volume": volume.reshape(-1),
         "total_charge": charge,
-        "total_spin": multiplicity
+        "total_spin": multiplicity,
+        "external_field": torch.zeros((charge.shape[0], 3), dtype=dtype, device=ptr.device),
+        "fermi_level": torch.zeros((1,), dtype=dtype, device=ptr.device)
     }
     results = model(inputDict, compute_force=True)
     energy = float(results[returnEnergyType].detach())*energyScale

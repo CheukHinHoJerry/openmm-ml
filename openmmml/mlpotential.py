@@ -199,6 +199,7 @@ class MLPotential(object):
             be used to customize them.  See the documentation on the specific
             potential functions for more information.
         """
+        self._defaultArgs = dict(args)
         self._impl = MLPotential._implFactories[name].createImpl(name, **args)
 
     def createSystem(self, topology: openmm.app.Topology, removeCMMotion: bool = True, **args) -> openmm.System:
@@ -227,7 +228,9 @@ class MLPotential(object):
                 system.addParticle(0)
             else:
                 system.addParticle(atom.element.mass)
-        self._impl.addForces(topology, system, None, 0, **args)
+        mergedArgs = dict(self._defaultArgs)
+        mergedArgs.update(args)
+        self._impl.addForces(topology, system, None, 0, **mergedArgs)
         if removeCMMotion:
             system.addForce(openmm.CMMotionRemover())
         return system
@@ -296,6 +299,9 @@ class MLPotential(object):
         -------
         a newly created System object that uses this potential function to model the Topology
         """
+        mergedArgs = dict(self._defaultArgs)
+        mergedArgs.update(args)
+
         # Create the new System, removing bonded interactions within the ML subset.
 
         newSystem = self._removeBonds(system, atoms, True, removeConstraints)
@@ -320,14 +326,14 @@ class MLPotential(object):
         # Add the ML potential.
 
         if not interpolate:
-            self._impl.addForces(topology, newSystem, atomList, forceGroup, **args)
+            self._impl.addForces(topology, newSystem, atomList, forceGroup, **mergedArgs)
         else:
             # Create a CustomCVForce and put the ML forces inside it.
 
             cv = openmm.CustomCVForce('')
             cv.addGlobalParameter('lambda_interpolate', 1)
             tempSystem = openmm.System()
-            self._impl.addForces(topology, tempSystem, atomList, forceGroup, **args)
+            self._impl.addForces(topology, tempSystem, atomList, forceGroup, **mergedArgs)
             mlVarNames = []
             for i, force in enumerate(tempSystem.getForces()):
                 name = f'mlForce{i+1}'
