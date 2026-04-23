@@ -297,6 +297,11 @@ def _computeMACE(state, model, ptr, node_attrs, batch, pbc, returnEnergyType, ch
         if np.any(s == 0.0):
             raise ValueError("Link-atom Q and M coincident at this step.")
         C_L = linkInfo["target_dist"] / s
+        if np.any(~np.isfinite(C_L)) or np.any(C_L <= 0.0) or np.any(C_L >= 1.0):
+            raise ValueError(
+                f"Link-atom C_L out of (0, 1) at runtime: {C_L}. "
+                "Check that target_dist < current |r_M - r_Q| for every cap."
+            )
         pos_link = (1.0 - C_L)[:, None] * r_Q + C_L[:, None] * r_M
         positions = np.concatenate([positions, pos_link], axis=0)
 
@@ -349,6 +354,11 @@ def _computeMACE(state, model, ptr, node_attrs, batch, pbc, returnEnergyType, ch
             v = r_M - r_Q
             s = np.linalg.norm(v, axis=1)
             C_L = linkInfo["target_dist"] / s
+            if np.any(~np.isfinite(C_L)) or np.any(C_L <= 0.0) or np.any(C_L >= 1.0):
+                raise ValueError(
+                    f"Link-atom C_L out of (0, 1) at runtime: {C_L}. "
+                    "Check that target_dist < current |r_M - r_Q| for every cap."
+                )
             e_b = v / s[:, None]
             proj = np.einsum("ki,ki->k", f_link, e_b)
             F_Q_add = (1.0 - C_L)[:, None] * f_link + (C_L * proj)[:, None] * e_b
@@ -398,6 +408,7 @@ def _prepareLinkRecords(linkRecords, atoms, topology, system):
     if not tuples:
         return None
 
+    num_particles = int(system.getNumParticles())
     atoms_set = set(int(a) for a in atoms)
     seen_pairs: set = set()
     seen_q: set = set()
@@ -406,6 +417,10 @@ def _prepareLinkRecords(linkRecords, atoms, topology, system):
     m_global = np.empty(len(tuples), dtype=np.int64)
     target_dist = np.empty(len(tuples), dtype=np.float64)
     for k, (q, m, td) in enumerate(tuples):
+        if not (0 <= q < num_particles):
+            raise ValueError(f"linkRecords[{k}]: q_global={q} out of range [0, {num_particles}).")
+        if not (0 <= m < num_particles):
+            raise ValueError(f"linkRecords[{k}]: m_global={m} out of range [0, {num_particles}).")
         if q not in atoms_set:
             raise ValueError(f"linkRecords[{k}]: q_global={q} is not in `atoms`.")
         if m in atoms_set:
