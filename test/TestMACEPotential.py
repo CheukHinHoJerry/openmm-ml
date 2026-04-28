@@ -12,6 +12,7 @@ from openmmml.models.macepotential import (
     _computeMACE,
     _prepareMMEmbedding,
     _removeMLMMElectrostatics,
+    _should_use_mm_embedding,
 )
 
 mace = pytest.importorskip("mace", reason="mace is not installed")
@@ -104,6 +105,14 @@ class _FakeModel:
         return out
 
 
+class PolarMACE:
+    pass
+
+
+class MACE:
+    pass
+
+
 def testComputeMACEScattersMMForces():
     ptr = torch.tensor([0, 2], dtype=torch.long)
     node_attrs = torch.ones((2, 1), dtype=torch.float32)
@@ -137,6 +146,15 @@ def testComputeMACEScattersMMForces():
         dtype=np.float32,
     ) * (96.4853 * 10.0)
     np.testing.assert_allclose(forces, expected, rtol=1e-6, atol=1e-6)
+
+
+def testShouldUseMMEmbedding():
+    assert _should_use_mm_embedding(PolarMACE(), [0, 1], "electrostatic")
+    assert not _should_use_mm_embedding(PolarMACE(), [0, 1], "mechanical")
+    assert not _should_use_mm_embedding(PolarMACE(), None, "electrostatic")
+    assert not _should_use_mm_embedding(MACE(), [0, 1], "electrostatic")
+    with pytest.raises(ValueError, match="Unsupported embedding mode"):
+        _should_use_mm_embedding(PolarMACE(), [0, 1], "bad-mode")
 
 @pytest.mark.parametrize("platform_int", list(platform_ints))
 class TestMACE:
