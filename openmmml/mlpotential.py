@@ -301,27 +301,74 @@ class MLPotential(object):
         """
         mergedArgs = dict(self._defaultArgs)
         mergedArgs.update(args)
+        electrostatic_embedding = mergedArgs.get('embedding') == 'electrostatic'
 
-        # Create the new System, removing bonded interactions within the ML subset.
+        # For electrostatic embedding, remove bonded terms that touch the ML
+        # region and remove only the classical electrostatics replaced by the
+        # ML/MM coupling. Classical ML-MM Lennard-Jones stays in the MM force
+        # field. Mechanical embedding preserves the previous mixed-system
+        # behavior.
 
-        newSystem = self._removeBonds(system, atoms, True, removeConstraints)
-
-        # Add nonbonded exceptions and exclusions.
+        if electrostatic_embedding:
+            newSystem = self._removeBondsInvolvingAtoms(system, atoms, removeConstraints)
+        else:
+            newSystem = self._removeBonds(system, atoms, True, removeConstraints)
 
         atomList = list(atoms)
         for force in newSystem.getForces():
             if isinstance(force, openmm.NonbondedForce):
-                for i in range(len(atomList)):
-                    for j in range(i):
-                        force.addException(atomList[i], atomList[j], 0, 1, 0, True)
+                if electrostatic_embedding:
+                    atomSet = set(atomList)
+                    numParticles = force.getNumParticles()
+                    for i in range(numParticles):
+                        charge, sigma, epsilon = force.getParticleParameters(i)
+                        if i in atomSet:
+                            # Zero only the direct Coulomb part on ML atoms.
+                            # Sigma/epsilon stay so ML-MM LJ survives.
+                            force.setParticleParameters(i, 0*charge, sigma, epsilon)
+                    existing = {}
+                    for i in range(force.getNumExceptions()):
+                        p1, p2, chargeProd, sigma, epsilon = force.getExceptionParameters(i)
+                        existing[(int(p1), int(p2))] = (chargeProd, sigma, epsilon)
+                    for i in range(numParticles):
+                        i_in_ml = i in atomSet
+                        for j in range(i):
+                            if not (i_in_ml or j in atomSet):
+                                continue
+                            key = (i, j)
+                            rev = (j, i)
+                            if key in existing:
+                                _, sigma, epsilon = existing[key]
+                            elif rev in existing:
+                                _, sigma, epsilon = existing[rev]
+                            else:
+                                _, sigma1, epsilon1 = force.getParticleParameters(i)
+                                _, sigma2, epsilon2 = force.getParticleParameters(j)
+                                sigma = 0.5*(sigma1+sigma2)
+                                epsilon = unit.sqrt(epsilon1*epsilon2)
+                            if i_in_ml and j in atomSet:
+                                epsilon = 0*epsilon
+                            force.addException(i, j, 0, sigma, epsilon, True)
+                else:
+                    for i in range(len(atomList)):
+                        for j in range(i):
+                            force.addException(atomList[i], atomList[j], 0, 1, 0, True)
             elif isinstance(force, openmm.CustomNonbondedForce):
                 existing = set(tuple(force.getExclusionParticles(i)) for i in range(force.getNumExclusions()))
-                for i in range(len(atomList)):
-                    a1 = atomList[i]
-                    for j in range(i):
-                        a2 = atomList[j]
-                        if (a1, a2) not in existing and (a2, a1) not in existing:
-                            force.addExclusion(a1, a2)
+                if electrostatic_embedding:
+                    for i in range(len(atomList)):
+                        a1 = atomList[i]
+                        for j in range(i):
+                            a2 = atomList[j]
+                            if (a1, a2) not in existing and (a2, a1) not in existing:
+                                force.addExclusion(a1, a2)
+                else:
+                    for i in range(len(atomList)):
+                        a1 = atomList[i]
+                        for j in range(i):
+                            a2 = atomList[j]
+                            if (a1, a2) not in existing and (a2, a1) not in existing:
+                                force.addExclusion(a1, a2)
 
         # Add the ML potential.
 
@@ -462,6 +509,58 @@ class MLPotential(object):
                         constraints.remove(constraint)
 
         # Create a new System from it.
+
+        return openmm.XmlSerializer.deserialize(ET.tostring(root, encoding='unicode'))
+
+    def _removeBondsInvolvingAtoms(self, system: openmm.System, atoms: Iterable[int], removeConstraints: bool) -> openmm.System:
+        """Copy a System, removing all bonded interactions that involve any atom in a set.
+
+        Parameters
+        ----------
+        system: System
+            the System to copy
+        atoms: Iterable[int]
+            a set of atom indices
+        removeConstraints: bool
+            if True, remove constraints involving atoms in the set
+
+        Returns
+        -------
+        a newly created System object in which any bonded term touching the set
+        has been removed
+        """
+        atomSet = set(atoms)
+
+        import xml.etree.ElementTree as ET
+        xml = openmm.XmlSerializer.serialize(system)
+        root = ET.fromstring(xml)
+
+        def shouldRemove(termAtoms):
+            return any(a in atomSet for a in termAtoms)
+
+        for bonds in root.findall('./Forces/Force/Bonds'):
+            for bond in bonds.findall('Bond'):
+                bondAtoms = [int(bond.attrib[p]) for p in ('p1', 'p2')]
+                if shouldRemove(bondAtoms):
+                    bonds.remove(bond)
+        for angles in root.findall('./Forces/Force/Angles'):
+            for angle in angles.findall('Angle'):
+                angleAtoms = [int(angle.attrib[p]) for p in ('p1', 'p2', 'p3')]
+                if shouldRemove(angleAtoms):
+                    angles.remove(angle)
+        for torsions in root.findall('./Forces/Force/Torsions'):
+            for torsion in torsions.findall('Torsion'):
+                torsionLabels = ('p1', 'p2', 'p3', 'p4') if 'p1' in torsion.attrib else ('a1', 'a2', 'a3', 'a4', 'b1', 'b2', 'b3', 'b4')
+                torsionAtoms = [int(torsion.attrib[p]) for p in torsionLabels]
+                if shouldRemove(torsionAtoms):
+                    torsions.remove(torsion)
+
+        if removeConstraints:
+            for constraints in root.findall('./Constraints'):
+                for constraint in constraints.findall('Constraint'):
+                    constraintAtoms = [int(constraint.attrib[p]) for p in ('p1', 'p2')]
+                    if shouldRemove(constraintAtoms):
+                        constraints.remove(constraint)
 
         return openmm.XmlSerializer.deserialize(ET.tostring(root, encoding='unicode'))
 
