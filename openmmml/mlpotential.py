@@ -302,17 +302,20 @@ class MLPotential(object):
         mergedArgs = dict(self._defaultArgs)
         mergedArgs.update(args)
         electrostatic_embedding = mergedArgs.get('embedding') == 'electrostatic'
+        if electrostatic_embedding and interpolate:
+            raise ValueError(
+                "interpolate=True is not currently supported with embedding='electrostatic'. "
+                "Electrostatic embedding removes classical ML-MM Coulomb outside the "
+                "interpolation CustomCVForce, so lambda_interpolate=0 would not reproduce "
+                "the conventional MM endpoint."
+            )
 
-        # For electrostatic embedding, remove bonded terms that touch the ML
-        # region and remove only the classical electrostatics replaced by the
-        # ML/MM coupling. Classical ML-MM Lennard-Jones stays in the MM force
-        # field. Mechanical embedding preserves the previous mixed-system
-        # behavior.
+        # Remove ML-internal bonded terms. In electrostatic embedding, ML/MM
+        # boundary bonded terms remain classical by default; only the classical
+        # electrostatics replaced by the ML/MM coupling are removed below.
+        # Classical ML-MM Lennard-Jones stays in the MM force field.
 
-        if electrostatic_embedding:
-            newSystem = self._removeBondsInvolvingAtoms(system, atoms, removeConstraints)
-        else:
-            newSystem = self._removeBonds(system, atoms, True, removeConstraints)
+        newSystem = self._removeBonds(system, atoms, True, removeConstraints)
 
         atomList = list(atoms)
         for force in newSystem.getForces():
@@ -509,58 +512,6 @@ class MLPotential(object):
                         constraints.remove(constraint)
 
         # Create a new System from it.
-
-        return openmm.XmlSerializer.deserialize(ET.tostring(root, encoding='unicode'))
-
-    def _removeBondsInvolvingAtoms(self, system: openmm.System, atoms: Iterable[int], removeConstraints: bool) -> openmm.System:
-        """Copy a System, removing all bonded interactions that involve any atom in a set.
-
-        Parameters
-        ----------
-        system: System
-            the System to copy
-        atoms: Iterable[int]
-            a set of atom indices
-        removeConstraints: bool
-            if True, remove constraints involving atoms in the set
-
-        Returns
-        -------
-        a newly created System object in which any bonded term touching the set
-        has been removed
-        """
-        atomSet = set(atoms)
-
-        import xml.etree.ElementTree as ET
-        xml = openmm.XmlSerializer.serialize(system)
-        root = ET.fromstring(xml)
-
-        def shouldRemove(termAtoms):
-            return any(a in atomSet for a in termAtoms)
-
-        for bonds in root.findall('./Forces/Force/Bonds'):
-            for bond in bonds.findall('Bond'):
-                bondAtoms = [int(bond.attrib[p]) for p in ('p1', 'p2')]
-                if shouldRemove(bondAtoms):
-                    bonds.remove(bond)
-        for angles in root.findall('./Forces/Force/Angles'):
-            for angle in angles.findall('Angle'):
-                angleAtoms = [int(angle.attrib[p]) for p in ('p1', 'p2', 'p3')]
-                if shouldRemove(angleAtoms):
-                    angles.remove(angle)
-        for torsions in root.findall('./Forces/Force/Torsions'):
-            for torsion in torsions.findall('Torsion'):
-                torsionLabels = ('p1', 'p2', 'p3', 'p4') if 'p1' in torsion.attrib else ('a1', 'a2', 'a3', 'a4', 'b1', 'b2', 'b3', 'b4')
-                torsionAtoms = [int(torsion.attrib[p]) for p in torsionLabels]
-                if shouldRemove(torsionAtoms):
-                    torsions.remove(torsion)
-
-        if removeConstraints:
-            for constraints in root.findall('./Constraints'):
-                for constraint in constraints.findall('Constraint'):
-                    constraintAtoms = [int(constraint.attrib[p]) for p in ('p1', 'p2')]
-                    if shouldRemove(constraintAtoms):
-                        constraints.remove(constraint)
 
         return openmm.XmlSerializer.deserialize(ET.tostring(root, encoding='unicode'))
 
