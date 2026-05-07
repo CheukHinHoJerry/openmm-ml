@@ -301,27 +301,77 @@ class MLPotential(object):
         """
         mergedArgs = dict(self._defaultArgs)
         mergedArgs.update(args)
+        electrostatic_embedding = mergedArgs.get('embedding') == 'electrostatic'
+        if electrostatic_embedding and interpolate:
+            raise ValueError(
+                "interpolate=True is not currently supported with embedding='electrostatic'. "
+                "Electrostatic embedding removes classical ML-MM Coulomb outside the "
+                "interpolation CustomCVForce, so lambda_interpolate=0 would not reproduce "
+                "the conventional MM endpoint."
+            )
 
-        # Create the new System, removing bonded interactions within the ML subset.
+        # Remove ML-internal bonded terms. In electrostatic embedding, ML/MM
+        # boundary bonded terms remain classical by default; only the classical
+        # electrostatics replaced by the ML/MM coupling are removed below.
+        # Classical ML-MM Lennard-Jones stays in the MM force field.
 
         newSystem = self._removeBonds(system, atoms, True, removeConstraints)
-
-        # Add nonbonded exceptions and exclusions.
 
         atomList = list(atoms)
         for force in newSystem.getForces():
             if isinstance(force, openmm.NonbondedForce):
-                for i in range(len(atomList)):
-                    for j in range(i):
-                        force.addException(atomList[i], atomList[j], 0, 1, 0, True)
+                if electrostatic_embedding:
+                    atomSet = set(atomList)
+                    numParticles = force.getNumParticles()
+                    for i in range(numParticles):
+                        charge, sigma, epsilon = force.getParticleParameters(i)
+                        if i in atomSet:
+                            # Zero only the direct Coulomb part on ML atoms.
+                            # Sigma/epsilon stay so ML-MM LJ survives.
+                            force.setParticleParameters(i, 0*charge, sigma, epsilon)
+                    existing = {}
+                    for i in range(force.getNumExceptions()):
+                        p1, p2, chargeProd, sigma, epsilon = force.getExceptionParameters(i)
+                        existing[(int(p1), int(p2))] = (chargeProd, sigma, epsilon)
+                    for i in range(numParticles):
+                        i_in_ml = i in atomSet
+                        for j in range(i):
+                            if not (i_in_ml or j in atomSet):
+                                continue
+                            key = (i, j)
+                            rev = (j, i)
+                            if key in existing:
+                                _, sigma, epsilon = existing[key]
+                            elif rev in existing:
+                                _, sigma, epsilon = existing[rev]
+                            else:
+                                _, sigma1, epsilon1 = force.getParticleParameters(i)
+                                _, sigma2, epsilon2 = force.getParticleParameters(j)
+                                sigma = 0.5*(sigma1+sigma2)
+                                epsilon = unit.sqrt(epsilon1*epsilon2)
+                            if i_in_ml and j in atomSet:
+                                epsilon = 0*epsilon
+                            force.addException(i, j, 0, sigma, epsilon, True)
+                else:
+                    for i in range(len(atomList)):
+                        for j in range(i):
+                            force.addException(atomList[i], atomList[j], 0, 1, 0, True)
             elif isinstance(force, openmm.CustomNonbondedForce):
                 existing = set(tuple(force.getExclusionParticles(i)) for i in range(force.getNumExclusions()))
-                for i in range(len(atomList)):
-                    a1 = atomList[i]
-                    for j in range(i):
-                        a2 = atomList[j]
-                        if (a1, a2) not in existing and (a2, a1) not in existing:
-                            force.addExclusion(a1, a2)
+                if electrostatic_embedding:
+                    for i in range(len(atomList)):
+                        a1 = atomList[i]
+                        for j in range(i):
+                            a2 = atomList[j]
+                            if (a1, a2) not in existing and (a2, a1) not in existing:
+                                force.addExclusion(a1, a2)
+                else:
+                    for i in range(len(atomList)):
+                        a1 = atomList[i]
+                        for j in range(i):
+                            a2 = atomList[j]
+                            if (a1, a2) not in existing and (a2, a1) not in existing:
+                                force.addExclusion(a1, a2)
 
         # Add the ML potential.
 
