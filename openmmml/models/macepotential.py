@@ -265,12 +265,22 @@ def _supports_mm_embedding(model) -> bool:
     return model.__class__.__name__ == "PolarMACE"
 
 
+_SUPPORTED_EMBEDDINGS = ("mechanical", "electrostatic", "oniom-electrostatic")
+_MM_EMBEDDING_MODES = ("electrostatic", "oniom-electrostatic")
+
+
 def _should_use_mm_embedding(model, atoms: Optional[Iterable[int]], embedding: str) -> bool:
-    if embedding not in ("mechanical", "electrostatic"):
+    if embedding not in _SUPPORTED_EMBEDDINGS:
         raise ValueError(
-            f"Unsupported embedding mode '{embedding}'. Supported values are 'mechanical' and 'electrostatic'."
+            f"Unsupported embedding mode '{embedding}'. Supported values are "
+            + ", ".join(repr(m) for m in _SUPPORTED_EMBEDDINGS)
+            + "."
         )
-    return _supports_mm_embedding(model) and atoms is not None and embedding == "electrostatic"
+    return (
+        _supports_mm_embedding(model)
+        and atoms is not None
+        and embedding in _MM_EMBEDDING_MODES
+    )
 
 
 def _prepareMMEmbedding(system: openmm.System, atoms: Optional[Iterable[int]]):

@@ -301,7 +301,17 @@ class MLPotential(object):
         """
         mergedArgs = dict(self._defaultArgs)
         mergedArgs.update(args)
-        electrostatic_embedding = mergedArgs.get('embedding') == 'electrostatic'
+        embedding = mergedArgs.get('embedding')
+        if embedding == 'oniom-electrostatic':
+            # Slice 1 of docs/codex-plans/electrostatic-oniom-implementation-plan.md.
+            # The ONIOM-EE stack is not yet assembled; the API surface is
+            # reserved here so callers can pin against the future behavior.
+            raise NotImplementedError(
+                "embedding='oniom-electrostatic' is reserved but not yet "
+                "implemented. See docs/codex-plans/electrostatic-oniom-"
+                "implementation-plan.md for the planned slices."
+            )
+        electrostatic_embedding = embedding == 'electrostatic'
         if electrostatic_embedding and interpolate:
             raise ValueError(
                 "interpolate=True is not currently supported with embedding='electrostatic'. "
