@@ -303,13 +303,16 @@ class MLPotential(object):
         mergedArgs.update(args)
         embedding = mergedArgs.get('embedding')
         if embedding == 'oniom-electrostatic':
-            # Slice 1 of docs/codex-plans/electrostatic-oniom-implementation-plan.md.
-            # The ONIOM-EE stack is not yet assembled; the API surface is
-            # reserved here so callers can pin against the future behavior.
-            raise NotImplementedError(
-                "embedding='oniom-electrostatic' is reserved but not yet "
-                "implemented. See docs/codex-plans/electrostatic-oniom-"
-                "implementation-plan.md for the planned slices."
+            # Slice 3 of docs/codex-plans/electrostatic-oniom-implementation-plan.md.
+            # Closed-valence path only: linkRecords=None.
+            return self._build_oniom_mixed_system(
+                topology=topology,
+                system=system,
+                atoms=atoms,
+                forceGroup=forceGroup,
+                interpolate=interpolate,
+                removeConstraints=removeConstraints,
+                mergedArgs=mergedArgs,
             )
         electrostatic_embedding = embedding == 'electrostatic'
         if electrostatic_embedding and interpolate:
@@ -460,6 +463,147 @@ class MLPotential(object):
             cv.setEnergyFunction(f'lambda_interpolate*({mlSum}) + (1-lambda_interpolate)*({mmSum})')
             newSystem.addForce(cv)
         return newSystem
+
+    def _build_oniom_mixed_system(
+        self,
+        topology: openmm.app.Topology,
+        system: openmm.System,
+        atoms: Iterable[int],
+        forceGroup: int,
+        interpolate: bool,
+        removeConstraints: bool,
+        mergedArgs: dict,
+    ) -> openmm.System:
+        """Assemble the ONIOM-EE host System (closed-valence case).
+
+        Slice 3 of docs/codex-plans/electrostatic-oniom-implementation-plan.md.
+        Capped (`linkRecords != None`) systems are reserved for Slice 4 and
+        rejected here.
+
+        The host is a deep copy of the source MM ``system`` with one
+        narrow surgery: ML particle charges are zeroed (and ML-* exception
+        chargeProd zeroed) so the PME reciprocal-space ML-* contributions
+        vanish. ML-internal bonded terms and ML-internal LJ stay in place
+        and are cancelled additively by a low-model correction wrapped in
+        a ``CustomCVForce`` with coefficient ``-1``. The MACE high-level
+        force is added on top with coefficient ``+1`` via ``_impl.addForces``.
+
+        Net energy:
+
+            E = E_MM(host with ML charges zeroed)
+              + E_MACE(ml, +MM charges)
+              - E_low_model(ML-internal bonded + ML-internal LJ)
+        """
+        from .embedding import OniomLowModelBuilder
+
+        if interpolate:
+            raise ValueError(
+                "interpolate=True is not currently supported with "
+                "embedding='oniom-electrostatic'. The ONIOM low-model "
+                "correction is added as a separate Force, not inside the "
+                "interpolation CustomCVForce."
+            )
+        if atoms is None:
+            raise ValueError(
+                "embedding='oniom-electrostatic' requires an explicit ml-atoms "
+                "list."
+            )
+        if mergedArgs.get('linkRecords') is not None:
+            raise NotImplementedError(
+                "Capped (link-atom) ONIOM is reserved for Slice 4. The "
+                "current implementation only supports closed-valence ML "
+                "regions (linkRecords=None)."
+            )
+
+        atomList = [int(i) for i in atoms]
+        atomSet = set(atomList)
+
+        new_system = deepcopy(system)
+        if removeConstraints:
+            self._oniom_remove_internal_constraints(new_system, atomSet)
+        self._oniom_apply_charge_only_surgery(new_system, atomList, atomSet)
+
+        self._impl.addForces(topology, new_system, atomList, forceGroup, **mergedArgs)
+
+        builder = OniomLowModelBuilder(system, atomList)
+        low_model_forces = list(builder.internal_bonded_forces())
+        lj = builder.internal_lj_force()
+        if lj is not None:
+            low_model_forces.append(lj)
+        if low_model_forces:
+            cv = openmm.CustomCVForce("")
+            names = []
+            for i, f in enumerate(low_model_forces):
+                name = f"oniom_lm_{i}"
+                cv.addCollectiveVariable(name, f)
+                names.append(name)
+            cv.setEnergyFunction("-1*(" + " + ".join(names) + ")")
+            cv.setForceGroup(forceGroup)
+            new_system.addForce(cv)
+        return new_system
+
+    @staticmethod
+    def _oniom_apply_charge_only_surgery(
+        new_system: openmm.System, atomList: Iterable[int], atomSet: set
+    ) -> None:
+        """Zero ML particle charges + ML-* exception chargeProd in every
+        ``NonbondedForce``. Sigma/epsilon are preserved everywhere; LJ is
+        kept intact and will be cancelled (for ML-internal pairs) via the
+        low-model correction.
+
+        Mirrors the existing electrostatic-mode surgery minus the
+        ML-internal LJ removal and the ML-internal bonded removal.
+        """
+        for force in new_system.getForces():
+            if isinstance(force, openmm.NonbondedForce):
+                numParticles = force.getNumParticles()
+                for i in range(numParticles):
+                    if i in atomSet:
+                        charge, sigma, epsilon = force.getParticleParameters(i)
+                        force.setParticleParameters(i, 0 * charge, sigma, epsilon)
+                existing = {}
+                for i in range(force.getNumExceptions()):
+                    p1, p2, chargeProd, sigma, epsilon = force.getExceptionParameters(i)
+                    existing[(int(p1), int(p2))] = (chargeProd, sigma, epsilon)
+                for i in range(numParticles):
+                    i_in_ml = i in atomSet
+                    for j in range(i):
+                        if not (i_in_ml or j in atomSet):
+                            continue
+                        key = (i, j)
+                        rev = (j, i)
+                        if key in existing:
+                            _, sigma, epsilon = existing[key]
+                        elif rev in existing:
+                            _, sigma, epsilon = existing[rev]
+                        else:
+                            _, sigma1, epsilon1 = force.getParticleParameters(i)
+                            _, sigma2, epsilon2 = force.getParticleParameters(j)
+                            sigma = 0.5 * (sigma1 + sigma2)
+                            epsilon = unit.sqrt(epsilon1 * epsilon2)
+                        force.addException(i, j, 0, sigma, epsilon, True)
+            elif isinstance(force, openmm.CustomNonbondedForce):
+                existing = set(
+                    tuple(force.getExclusionParticles(i))
+                    for i in range(force.getNumExclusions())
+                )
+                lst = list(atomList)
+                for i in range(len(lst)):
+                    a1 = lst[i]
+                    for j in range(i):
+                        a2 = lst[j]
+                        if (a1, a2) not in existing and (a2, a1) not in existing:
+                            force.addExclusion(a1, a2)
+
+    @staticmethod
+    def _oniom_remove_internal_constraints(
+        new_system: openmm.System, atomSet: set
+    ) -> None:
+        """Remove constraints whose two atoms are both in the ML set."""
+        for idx in reversed(range(new_system.getNumConstraints())):
+            p1, p2, _ = new_system.getConstraintParameters(idx)
+            if int(p1) in atomSet and int(p2) in atomSet:
+                new_system.removeConstraint(idx)
 
     def _removeBonds(self, system: openmm.System, atoms: Iterable[int], removeInSet: bool, removeConstraints: bool) -> openmm.System:
         """Copy a System, removing all bonded interactions between atoms in (or not in) a particular set.

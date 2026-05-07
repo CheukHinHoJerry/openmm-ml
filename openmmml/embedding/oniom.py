@@ -213,15 +213,36 @@ class OniomLowModelBuilder:
             substituting it would leave a non-physical residual in the
             ONIOM cancellation. See module docstring and Slice 5.
         """
+        return self._build_internal_pair_force(include_coulomb=True)
+
+    def internal_lj_force(self) -> Optional[openmm.CustomBondForce]:
+        """Return a `CustomBondForce` evaluating only ML-internal LJ.
+
+        Useful when the host `System` has already zeroed ML particle
+        charges (so the Coulomb term in `internal_nonbonded_force` would
+        be a no-op for the host but a non-zero subtraction in the
+        low-model — Slice 3 of the plan doc).
+        """
+        return self._build_internal_pair_force(include_coulomb=False)
+
+    def _build_internal_pair_force(
+        self, include_coulomb: bool
+    ) -> Optional[openmm.CustomBondForce]:
         nb = self._find_nonbonded()
         if nb is None:
             return None
         _raise_if_unsupported_coulomb_source(nb, "internal_nonbonded_force")
 
-        force = openmm.CustomBondForce(
-            f"{COULOMB_KJ_NM}*chargeProd/r + 4*epsilon*((sigma/r)^12-(sigma/r)^6)"
-        )
-        force.addPerBondParameter("chargeProd")
+        if include_coulomb:
+            energy = (
+                f"{COULOMB_KJ_NM}*chargeProd/r + 4*epsilon*((sigma/r)^12-(sigma/r)^6)"
+            )
+        else:
+            energy = "4*epsilon*((sigma/r)^12-(sigma/r)^6)"
+
+        force = openmm.CustomBondForce(energy)
+        if include_coulomb:
+            force.addPerBondParameter("chargeProd")
         force.addPerBondParameter("sigma")
         force.addPerBondParameter("epsilon")
         # Non-PBC source by construction (the periodic case raised above);
@@ -239,9 +260,14 @@ class OniomLowModelBuilder:
                     chargeProd = atom_charge[i] * atom_charge[j]
                     sigma = 0.5 * (atom_sigma[i] + atom_sigma[j])
                     epsilon = (atom_epsilon[i] * atom_epsilon[j]) ** 0.5
-                if chargeProd == 0.0 and epsilon == 0.0:
-                    continue
-                force.addBond(i, j, [chargeProd, sigma, epsilon])
+                if include_coulomb:
+                    if chargeProd == 0.0 and epsilon == 0.0:
+                        continue
+                    force.addBond(i, j, [chargeProd, sigma, epsilon])
+                else:
+                    if epsilon == 0.0:
+                        continue
+                    force.addBond(i, j, [sigma, epsilon])
         if force.getNumBonds() == 0:
             return None
         return force

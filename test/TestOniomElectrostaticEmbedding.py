@@ -54,15 +54,110 @@ def _minimal_system_and_topology():
     return topology, system
 
 
-def test_create_mixed_system_with_oniom_raises_not_implemented():
-    """The mode is recognized at the API boundary and raises a clear
-    NotImplementedError pointing to the plan doc."""
+def test_create_mixed_system_with_oniom_closed_valence_returns_system():
+    """Closed-valence ONIOM (linkRecords=None) is implemented as of Slice 3
+    and returns an `openmm.System`."""
     topology, system = _minimal_system_and_topology()
     potential = MLPotential("noop_oniom_test")
-    with pytest.raises(NotImplementedError, match="oniom-electrostatic"):
+    new_system = potential.createMixedSystem(
+        topology, system, [0, 1], embedding="oniom-electrostatic"
+    )
+    assert isinstance(new_system, openmm.System)
+    assert new_system.getNumParticles() == system.getNumParticles()
+
+
+def test_create_mixed_system_with_oniom_link_records_raises_not_implemented():
+    """Capped (linkRecords != None) ONIOM is reserved for Slice 4."""
+    topology, system = _minimal_system_and_topology()
+    potential = MLPotential("noop_oniom_test")
+    with pytest.raises(NotImplementedError, match="link-atom"):
         potential.createMixedSystem(
-            topology, system, [0, 1], embedding="oniom-electrostatic"
+            topology,
+            system,
+            [0, 1],
+            embedding="oniom-electrostatic",
+            linkRecords=[(0, 2, 0.109)],
         )
+
+
+def test_create_mixed_system_with_oniom_no_atoms_raises_value_error():
+    """Caller must specify ml_atoms."""
+    topology, system = _minimal_system_and_topology()
+    potential = MLPotential("noop_oniom_test")
+    with pytest.raises(ValueError, match="ml-atoms"):
+        potential.createMixedSystem(
+            topology, system, None, embedding="oniom-electrostatic"
+        )
+
+
+def test_create_mixed_system_with_oniom_interpolate_raises_value_error():
+    """ONIOM does not support `interpolate=True`."""
+    topology, system = _minimal_system_and_topology()
+    potential = MLPotential("noop_oniom_test")
+    with pytest.raises(ValueError, match="interpolate=True"):
+        potential.createMixedSystem(
+            topology, system, [0, 1], embedding="oniom-electrostatic", interpolate=True
+        )
+
+
+def test_oniom_zeros_ml_charges_and_keeps_lj():
+    """The Slice 3 host surgery zeros ML particle charges and ML-* exception
+    chargeProd. Sigma/epsilon are preserved on every particle and exception."""
+    topology, system = _minimal_system_and_topology()
+    # Add a non-zero charge so we can prove zeroing happens.
+    nb = system.getForce(0)
+    nb.setParticleParameters(
+        0, 0.5 * unit.elementary_charge, 0.30 * unit.nanometer, 0.20 * unit.kilojoule_per_mole
+    )
+    nb.setParticleParameters(
+        1, -0.3 * unit.elementary_charge, 0.32 * unit.nanometer, 0.25 * unit.kilojoule_per_mole
+    )
+    nb.setParticleParameters(
+        2, 0.1 * unit.elementary_charge, 0.31 * unit.nanometer, 0.65 * unit.kilojoule_per_mole
+    )
+    potential = MLPotential("noop_oniom_test")
+    new_system = potential.createMixedSystem(
+        topology, system, [0, 1], embedding="oniom-electrostatic"
+    )
+    new_nb = next(
+        f for f in new_system.getForces() if isinstance(f, openmm.NonbondedForce)
+    )
+    # ML particles zeroed.
+    for i in (0, 1):
+        q, sigma, eps = new_nb.getParticleParameters(i)
+        assert q.value_in_unit(unit.elementary_charge) == pytest.approx(0.0, abs=1e-12)
+        assert sigma.value_in_unit(unit.nanometer) > 0
+    # MM particle untouched.
+    q2, _, _ = new_nb.getParticleParameters(2)
+    assert q2.value_in_unit(unit.elementary_charge) == pytest.approx(0.1, abs=1e-12)
+    # ML-* exceptions exist with chargeProd=0.
+    excs = {}
+    for i in range(new_nb.getNumExceptions()):
+        p1, p2, cp, sigma, eps = new_nb.getExceptionParameters(i)
+        excs[tuple(sorted((int(p1), int(p2))))] = (
+            cp.value_in_unit(unit.elementary_charge ** 2),
+            sigma.value_in_unit(unit.nanometer),
+            eps.value_in_unit(unit.kilojoule_per_mole),
+        )
+    assert excs[(0, 1)][0] == pytest.approx(0.0, abs=1e-15)
+    assert excs[(0, 2)][0] == pytest.approx(0.0, abs=1e-15)
+    assert excs[(1, 2)][0] == pytest.approx(0.0, abs=1e-15)
+    # ML-ML LJ retained: non-zero epsilon (low-model will subtract it).
+    assert excs[(0, 1)][2] > 0
+
+
+def test_oniom_low_model_correction_force_added():
+    """The low-model correction is added as a `CustomCVForce` with the
+    expected name/structure."""
+    topology, system = _minimal_system_and_topology()
+    potential = MLPotential("noop_oniom_test")
+    new_system = potential.createMixedSystem(
+        topology, system, [0, 1], embedding="oniom-electrostatic"
+    )
+    cv_forces = [f for f in new_system.getForces() if isinstance(f, openmm.CustomCVForce)]
+    assert len(cv_forces) == 1
+    cv = cv_forces[0]
+    assert cv.getEnergyFunction().startswith("-1*")
 
 
 def test_unknown_embedding_still_rejected_at_mace_layer():
