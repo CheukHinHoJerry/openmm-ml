@@ -233,8 +233,10 @@ class MACEPotentialImpl(MLPotentialImpl):
             indices = np.array(atoms)
         mmInfo = None
         if use_mm_embedding:
+            # ML-MM Coulomb is removed by MLPotential.createMixedSystem when
+            # embedding='electrostatic'. We only need MM positions/charges for
+            # the PolarMACE input here.
             mmInfo = _prepareMMEmbedding(system, atoms)
-            _removeMLMMElectrostatics(system, mmInfo)
         periodic = (topology.getPeriodicBoxVectors() is not None) or system.usesPeriodicBoundaryConditions()
 
         compute = partial(_computeMACE,
