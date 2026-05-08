@@ -65,19 +65,20 @@ def test_create_mixed_system_with_oniom_closed_valence_returns_system():
     assert new_system.getNumParticles() == system.getNumParticles()
 
 
-def test_create_mixed_system_with_oniom_link_records_still_raises():
-    """Slice 2′: capped ONIOM (linkRecords != None) is still gated to
-    Slice 3′."""
+def test_create_mixed_system_with_oniom_link_records_now_implemented():
+    """Slice 3′: capped ONIOM is implemented. linkRecords is accepted
+    and produces a working System with cap atoms in the model `Context`."""
     topology, system = _minimal_system_and_topology()
     potential = MLPotential("noop_oniom_test")
-    with pytest.raises(NotImplementedError, match="link-atom"):
-        potential.createMixedSystem(
-            topology,
-            system,
-            [0, 1],
-            embedding="oniom-electrostatic",
-            linkRecords=[(0, 2, 0.109)],
-        )
+    new_system = potential.createMixedSystem(
+        topology,
+        system,
+        [0, 1],
+        embedding="oniom-electrostatic",
+        linkRecords=[(0, 2, 1.09)],   # Q=0 (ML), M=2 (MM), target_dist in Å
+    )
+    assert isinstance(new_system, openmm.System)
+    assert new_system.getNumParticles() == system.getNumParticles()
 
 
 def test_create_mixed_system_with_oniom_no_atoms_raises_value_error():

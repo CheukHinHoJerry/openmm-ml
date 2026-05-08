@@ -29,6 +29,7 @@ OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
 USE OR OTHER DEALINGS IN THE SOFTWARE.
 """
 
+import numpy as np
 import openmm
 import openmm.app
 import openmm.unit as unit
@@ -488,21 +489,16 @@ class MLPotential(object):
     ) -> openmm.System:
         """Assemble a System for embedding='oniom-electrostatic'.
 
-        Closed-valence path (linkRecords=None) only. The host MM System
-        is left untouched. A model `Context` PythonForce, instantiated
-        lazily on first force evaluation, evaluates the MM force field
-        on the ML subsystem and contributes -E_MM(model) / -F_MM(model)
-        to the host. MACE provides E_high(model) via the existing
-        addForces path.
+        Supports both closed-valence (`linkRecords=None`) and capped
+        ML regions. The host MM System is left untouched. A model
+        `Context` PythonForce, instantiated lazily on first force
+        evaluation, evaluates the MM force field on the (possibly
+        capped) ML subsystem and contributes -E_MM(model) /
+        -F_MM(model) to the host. MACE provides E_high(model) via the
+        existing addForces path.
 
         Total: E_total = E_MM(real) + E_MACE - E_MM(model).
         """
-        if mergedArgs.get('linkRecords') is not None:
-            raise NotImplementedError(
-                "Capped (link-atom) ONIOM is reserved for Slice 3′. The "
-                "current implementation only supports closed-valence ML "
-                "regions (linkRecords=None)."
-            )
         if atoms is None:
             raise ValueError(
                 "embedding='oniom-electrostatic' requires an explicit "
@@ -511,17 +507,32 @@ class MLPotential(object):
 
         atomList = [int(i) for i in atoms]
 
+        # Normalize cap support args. linkRecords matches the existing
+        # MACE link-atom contract; capMMParams is keyed by (q, m) and
+        # provides MM force-field parameters for each cap atom.
+        link_records_arg = mergedArgs.get('linkRecords')
+        cap_mm_params_arg = mergedArgs.get('capMMParams')
+        cap_info = self._oniom_normalize_caps(
+            link_records_arg, cap_mm_params_arg, system, atomList,
+            topology, mergedArgs,
+        )
+
         # Host: deepcopy of source MM, no surgery. Bonded terms stay.
         # NonbondedForce stays. ML particle charges stay.
         host = deepcopy(system)
         if removeConstraints:
             self._oniom_remove_internal_constraints(host, set(atomList))
 
-        # Add MACE PythonForce (+1) to the host.
+        # Add MACE PythonForce (+1) to the host. linkRecords flow
+        # through to MACEPotentialImpl.addForces unchanged.
         self._impl.addForces(topology, host, atomList, forceGroup, **mergedArgs)
 
-        # Build model System for E_MM(model).
-        model_system = _build_oniom_model_system(system, atomList)
+        # Build model System for E_MM(model). With caps, K extra
+        # particles are appended at the end; their MM parameters come
+        # from cap_info.
+        model_system = _build_oniom_model_system(
+            system, atomList, cap_info=cap_info,
+        )
 
         # Wrap the model-Context evaluator in a PythonForce. Contributes
         # -E_MM(model) and -F_MM(model). Lazy Context instantiation
@@ -537,6 +548,7 @@ class MLPotential(object):
         closure = _make_oniom_low_model_closure(
             model_system,
             num_atoms=system.getNumParticles(),
+            cap_info=cap_info,
         )
         correction = PythonForce(closure)
         correction.setForceGroup(forceGroup)
@@ -561,6 +573,124 @@ class MLPotential(object):
             p1, p2, _ = new_system.getConstraintParameters(idx)
             if int(p1) in atomSet and int(p2) in atomSet:
                 new_system.removeConstraint(idx)
+
+    @staticmethod
+    def _oniom_normalize_caps(
+        link_records_arg,
+        cap_mm_params_arg,
+        system: openmm.System,
+        atomList,
+        topology,
+        mergedArgs: dict,
+    ):
+        """Normalize linkRecords + capMMParams into an internal cap_info dict.
+
+        Returns ``None`` when there are no caps (closed-valence, the
+        Slice 2′ path). Returns a dict with arrays / lists when caps
+        are present.
+
+        cap_info schema:
+
+            {
+              "K":              int,
+              "q_global":       np.ndarray of shape (K,) int64,
+              "m_global":       np.ndarray of shape (K,) int64,
+              "target_dist":    np.ndarray of shape (K,) float64 (nm),
+              "cap_charge":     np.ndarray of shape (K,) float64 (e),
+              "cap_sigma":      np.ndarray of shape (K,) float64 (nm),
+              "cap_epsilon":    np.ndarray of shape (K,) float64 (kJ/mol),
+            }
+
+        capMMParams: optional dict keyed by (q, m) tuples, value is
+        (charge_e, sigma_nm, epsilon_kjmol). Missing entries fall back
+        to a generic aliphatic-H default ``(0.0, 0.106, 0.0656)``.
+
+        Currently delegates to `MACEPotentialImpl._prepareLinkRecords`
+        for record validation (uniqueness, q ∈ atoms, m ∉ atoms,
+        non-PBC requirement, etc.) so we share the same enforcement
+        as MACE itself.
+        """
+        if link_records_arg is None:
+            if cap_mm_params_arg is not None:
+                raise ValueError(
+                    "capMMParams was provided but linkRecords is None. "
+                    "Each cap MM-params entry must correspond to a "
+                    "link record."
+                )
+            return None
+
+        # Reuse MACE's validator. Imports done lazily because openmmml
+        # users without MACE installed should still be able to import
+        # mlpotential.
+        from openmmml.models.macepotential import _prepareLinkRecords
+        link_info = _prepareLinkRecords(
+            link_records_arg, atomList, topology, system,
+        )
+        if link_info is None:
+            return None
+
+        K = int(link_info["K"])
+        q_global = link_info["q_global"]
+        m_global = link_info["m_global"]
+        target_dist_ang = link_info["target_dist"]
+        # MACE's _prepareLinkRecords stores target_dist in Angstroms
+        # (because MACE's _computeMACE works in Å). The model-Context
+        # closure here works in nm (OpenMM convention), so convert.
+        target_dist_nm = np.asarray(target_dist_ang, dtype=np.float64) * 0.1
+
+        # Default aliphatic-H force field params for the cap.
+        DEFAULT_CHARGE_E = 0.0
+        DEFAULT_SIGMA_NM = 0.106
+        DEFAULT_EPSILON_KJ = 0.0656
+
+        cap_charge = np.full(K, DEFAULT_CHARGE_E, dtype=np.float64)
+        cap_sigma = np.full(K, DEFAULT_SIGMA_NM, dtype=np.float64)
+        cap_epsilon = np.full(K, DEFAULT_EPSILON_KJ, dtype=np.float64)
+
+        if cap_mm_params_arg is not None:
+            if not isinstance(cap_mm_params_arg, dict):
+                raise TypeError(
+                    "capMMParams must be a dict keyed by (q, m) "
+                    "tuples; got "
+                    f"{type(cap_mm_params_arg).__name__}."
+                )
+            for k in range(K):
+                key = (int(q_global[k]), int(m_global[k]))
+                if key in cap_mm_params_arg:
+                    q_e, sig_nm, eps_kj = cap_mm_params_arg[key]
+                    cap_charge[k] = float(q_e)
+                    cap_sigma[k] = float(sig_nm)
+                    cap_epsilon[k] = float(eps_kj)
+
+        # PBC + non-zero cap charges is currently unsupported (CRITICAL
+        # caveat in the redesign plan): the model `Context` PME would
+        # see N+K charges while the host PME sees N, breaking the
+        # reciprocal-space cancellation. With cap charges = 0 the
+        # model PME's structure factor over caps is zero, so the
+        # asymmetry vanishes.
+        host_is_periodic = (
+            (topology.getPeriodicBoxVectors() is not None)
+            or system.usesPeriodicBoundaryConditions()
+        )
+        if host_is_periodic and np.any(cap_charge != 0.0):
+            raise NotImplementedError(
+                "Capped ONIOM under PBC currently requires cap charges "
+                "to be zero (the default). Non-zero cap charges break "
+                "the reciprocal-space cancellation between E_MM(real) "
+                "(N particles) and E_MM(model) (N+K particles). See "
+                "docs/codex-plans/electrostatic-oniom-redesign.md "
+                "(Slice 3′ design item)."
+            )
+
+        return {
+            "K": K,
+            "q_global": np.asarray(q_global, dtype=np.int64),
+            "m_global": np.asarray(m_global, dtype=np.int64),
+            "target_dist": target_dist_nm,
+            "cap_charge": cap_charge,
+            "cap_sigma": cap_sigma,
+            "cap_epsilon": cap_epsilon,
+        }
 
     def _removeBonds(self, system: openmm.System, atoms: Iterable[int], removeInSet: bool, removeConstraints: bool) -> openmm.System:
         """Copy a System, removing all bonded interactions between atoms in (or not in) a particular set.
@@ -706,7 +836,9 @@ _ONIOM_UNSUPPORTED_NONBONDED_LIKE = _oniom_resolve_unsupported_nonbonded_like()
 
 
 def _build_oniom_model_system(
-    source: openmm.System, ml_atoms: Iterable[int]
+    source: openmm.System,
+    ml_atoms: Iterable[int],
+    cap_info: Optional[dict] = None,
 ) -> openmm.System:
     """Build a `System` representing E_MM(model) for ONIOM-EE.
 
@@ -714,19 +846,25 @@ def _build_oniom_model_system(
       1. Clone the source `System` via `XmlSerializer` (preserves PME
          parameters, box vectors, masses, particles bit-exactly — pinned
          by Slice 0's `TestOniomSlice0Prereq.py`).
-      2. Strip every Force from the clone.
+      2. Strip every Force from the clone. If ``cap_info`` is provided,
+         also append ``K`` cap particles at the end of the clone (mass
+         = 1.008 amu, indices N..N+K-1 in the model `System`).
       3. Re-add bonded forces (HarmonicBond / HarmonicAngle /
          PeriodicTorsion) with entries restricted to ML-internal atom
          tuples. Each copy inherits `usesPeriodicBoundaryConditions()`
-         from the source.
+         from the source. (Cap-related bonded entries are NOT
+         synthesized from the MM force field — the user's source
+         topology has no Q-cap parameters, so the bonded picture of
+         the cap is left to MACE on the high side.)
       4. Re-add **every** ``NonbondedForce`` and ``CustomNonbondedForce``
          from the source as an opposite-sign pair wrapped in a single
          ``CustomCVForce`` whose energy is the sum of ``(a_i - b_i)``
          over all clones. ``b_i`` clones get the ML-side surgery that
-         removes the ML-related contribution; ``a_i - b_i`` therefore
-         evaluates exactly the ML-related contribution of that source
-         force in matching functional form. Multiple source nonbonded
-         forces (alchemical / layered setups) are all handled.
+         removes the ML-related contribution. With caps present, both
+         ``a_i`` and ``b_i`` clones have K extra particles appended
+         using ``cap_info``'s MM parameters; the surgery on ``b_i``
+         also zeros cap charges so cap-* Coulomb survives in
+         ``a_i - b_i`` (matching the ML-* surgery semantics).
 
     Raises
     ------
@@ -739,6 +877,7 @@ def _build_oniom_model_system(
         ``DrudeForce``).
     """
     ml_set = set(int(i) for i in ml_atoms)
+    K = 0 if cap_info is None else int(cap_info["K"])
 
     # 1. Full XML clone preserves PME params, box, particles, masses.
     clone_xml = openmm.XmlSerializer.serialize(source)
@@ -815,6 +954,23 @@ def _build_oniom_model_system(
         # are intentionally not copied — the ONIOM low-model only
         # accounts for ML-internal bonded + ML-* nonbonded.
 
+    # 3b. Append cap particles, if any. Cap atoms get hydrogen mass
+    # and are added to the model `System` *before* nonbonded clones
+    # are built so the clones see N+K particles.
+    if K > 0:
+        cap_atom_indices = []
+        for _ in range(K):
+            cap_atom_indices.append(model.addParticle(1.008))
+        # Cap atom indices are appended at the end: N..N+K-1.
+        cap_info_local = dict(cap_info)
+        cap_info_local["model_indices"] = np.asarray(cap_atom_indices, dtype=np.int64)
+        # Treat cap atoms as ML for the surgery (cap-* contributions
+        # need to be subtracted from the host the same way ML-* are).
+        ml_set_with_caps = ml_set | set(int(i) for i in cap_atom_indices)
+    else:
+        ml_set_with_caps = ml_set
+        cap_info_local = None
+
     # 4. Re-add every supported nonbonded-like source force as an
     # opposite-sign pair inside a single CustomCVForce. The energy is
     # the sum of (a_i - b_i) over all clones; each pair contributes
@@ -826,10 +982,37 @@ def _build_oniom_model_system(
             nb_xml = openmm.XmlSerializer.serialize(src_force)
             nb_a = openmm.XmlSerializer.deserialize(nb_xml)
             nb_b = openmm.XmlSerializer.deserialize(nb_xml)
+            # Append K cap particles to BOTH clones so they have the
+            # same particle count as the model `System`. Cap atoms get
+            # explicit MM force-field params from cap_info.
+            if K > 0:
+                if isinstance(src_force, openmm.NonbondedForce):
+                    for k in range(K):
+                        nb_a.addParticle(
+                            float(cap_info_local["cap_charge"][k]) * unit.elementary_charge,
+                            float(cap_info_local["cap_sigma"][k]) * unit.nanometer,
+                            float(cap_info_local["cap_epsilon"][k]) * unit.kilojoule_per_mole,
+                        )
+                        nb_b.addParticle(
+                            float(cap_info_local["cap_charge"][k]) * unit.elementary_charge,
+                            float(cap_info_local["cap_sigma"][k]) * unit.nanometer,
+                            float(cap_info_local["cap_epsilon"][k]) * unit.kilojoule_per_mole,
+                        )
+                elif isinstance(src_force, openmm.CustomNonbondedForce):
+                    # CustomNonbondedForce doesn't have a uniform charge
+                    # parameter list; cap atoms get default
+                    # per-particle parameters (zeros). Custom force
+                    # fields with non-trivial cap params would need a
+                    # follow-up.
+                    nb_a_per_particle = nb_a.getNumPerParticleParameters()
+                    nb_b_per_particle = nb_b.getNumPerParticleParameters()
+                    for _ in range(K):
+                        nb_a.addParticle([0.0] * nb_a_per_particle)
+                        nb_b.addParticle([0.0] * nb_b_per_particle)
             if isinstance(src_force, openmm.NonbondedForce):
-                _oniom_apply_nonbonded_surgery(nb_b, ml_set)
+                _oniom_apply_nonbonded_surgery(nb_b, ml_set_with_caps)
             elif isinstance(src_force, openmm.CustomNonbondedForce):
-                _oniom_apply_custom_nonbonded_surgery(nb_b, ml_set)
+                _oniom_apply_custom_nonbonded_surgery(nb_b, ml_set_with_caps)
             else:
                 # Should not reach here; caught by the validation loop above.
                 raise NotImplementedError(
@@ -929,7 +1112,9 @@ def _oniom_ordered_pair(i: int, j: int):
 
 
 def _make_oniom_low_model_closure(
-    model_system: openmm.System, num_atoms: int
+    model_system: openmm.System,
+    num_atoms: int,
+    cap_info: Optional[dict] = None,
 ):
     """Return a callable suitable for `openmm.PythonForce`.
 
@@ -940,17 +1125,28 @@ def _make_oniom_low_model_closure(
     Returns negated energy/forces so `addForce(PythonForce(closure))`
     contributes `-E_MM(model)` and `-F_MM(model)` to the host.
 
+    With caps (``cap_info != None``), per-step:
+      1. Read host positions (``num_atoms`` rows).
+      2. Compute K cap positions via the shared
+         ``compute_cap_positions`` helper (same formula MACE uses on
+         its side, so the same chemical region is consistent).
+      3. Set positions on the model `Context` for ``num_atoms + K``
+         particles.
+      4. After ``getState``, redistribute cap forces back onto Q,M
+         using ``redistribute_cap_force`` (the same Jacobian MACE's
+         ``_computeMACE`` uses).
+      5. Return ``num_atoms`` rows of forces (no cap rows in host).
+
     Notes
     -----
     The model `Context` defaults to OpenMM's Reference platform. For
-    Slice 2′ this is a correctness-only choice; performance work
-    (matching the host platform) is deferred. The model `System` is
-    the same size as the host so the per-step cost on Reference is
-    one PME evaluation comparable to the host's MM evaluation.
+    Slice 2′ / Slice 3′ this is a correctness-only choice; performance
+    work (matching the host platform) is deferred.
     """
     import numpy as np
 
     state = {"model_context": None}
+    K = 0 if cap_info is None else int(cap_info["K"])
 
     def closure(host_state):
         if state["model_context"] is None:
@@ -966,14 +1162,54 @@ def _make_oniom_low_model_closure(
             box = host_state.getPeriodicBoxVectors(asNumpy=True)
             ctx.setPeriodicBoxVectors(box[0], box[1], box[2])
 
-        ctx.setPositions(host_state.getPositions(asNumpy=True))
+        host_positions = host_state.getPositions(asNumpy=True)
+        if K == 0:
+            ctx.setPositions(host_positions)
+        else:
+            # Compute cap positions from current Q,M using the shared
+            # helper (matches MACE's _computeMACE side).
+            from openmmml.embedding._links import (
+                compute_cap_positions,
+                redistribute_cap_force,
+            )
+            host_pos_nm = host_positions.value_in_unit(unit.nanometer) \
+                if hasattr(host_positions, "value_in_unit") \
+                else np.asarray(host_positions)
+            r_Q = host_pos_nm[cap_info["q_global"]]
+            r_M = host_pos_nm[cap_info["m_global"]]
+            cap_pos, cap_C_L = compute_cap_positions(
+                r_Q, r_M, cap_info["target_dist"]
+            )
+            full_pos = np.concatenate(
+                [np.asarray(host_pos_nm, dtype=np.float64), cap_pos], axis=0
+            )
+            ctx.setPositions(full_pos * unit.nanometer)
+
         ms = ctx.getState(getEnergy=True, getForces=True)
         e = ms.getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)
-        f = ms.getForces(asNumpy=True).value_in_unit(
+        f_full = ms.getForces(asNumpy=True).value_in_unit(
             unit.kilojoule_per_mole / unit.nanometer
         )
+        f_full = np.asarray(f_full, dtype=np.float64)
+
+        if K == 0:
+            f = f_full
+        else:
+            # Split host atoms vs cap atoms; redistribute cap forces
+            # onto Q,M using the same Jacobian as MACE's _computeMACE.
+            f = np.zeros((num_atoms, 3), dtype=np.float64)
+            f[:] = f_full[:num_atoms]
+            f_cap = f_full[num_atoms:num_atoms + K]
+            F_Q_add, F_M_add = redistribute_cap_force(
+                f_cap, r_Q, r_M, cap_C_L
+            )
+            # q_global / m_global are guaranteed unique by
+            # _prepareLinkRecords, so plain += is safe.
+            f[cap_info["q_global"]] += F_Q_add
+            f[cap_info["m_global"]] += F_M_add
+
         # Sign flip: -E_MM(model), -F_MM(model)
-        return -float(e), -np.asarray(f, dtype=np.float64)
+        return -float(e), -f
 
     return closure
 
