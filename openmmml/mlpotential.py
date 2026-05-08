@@ -514,20 +514,15 @@ class MLPotential(object):
                 "current implementation only supports closed-valence ML "
                 "regions (linkRecords=None)."
             )
-        # PBC ONIOM is gated until the host MM PME / MACE GTO k-space
-        # functional-form mismatch in the low-model is resolved (Slice 5
-        # of the plan: purely-additive PME via opposite-sign-PME
-        # NonbondedForces). See:
-        #   https://github.com/CheukHinHoJerry/openmm-ml/issues
-        if _system_is_periodic(system) or _topology_is_periodic(topology):
-            raise NotImplementedError(
-                "embedding='oniom-electrostatic' is currently restricted to "
-                "non-periodic systems. The host MM NonbondedForce uses PME "
-                "(erfc(αr)/r + Ewald reciprocal) under PBC, which a "
-                "direct-space 1/r low-model cannot cancel exactly. See "
-                "Slice 5 of docs/codex-plans/electrostatic-oniom-"
-                "implementation-plan.md."
-            )
+        # PBC is supported. The Slice 3 charge-zeroing surgery zeros ML
+        # particle charges and ML-* exception chargeProd in the host, so
+        # PME contributes zero on every ML-related pair (direct AND
+        # reciprocal -- the structure factor over zero charges is zero).
+        # The low-model therefore only needs to subtract ML-internal
+        # bonded + ML-internal LJ -- both Ewald-free, both safe under
+        # PBC. The PME-vs-1/r mismatch only matters if a caller invokes
+        # the Coulomb-bearing builder helpers directly; those still raise
+        # under PBC (see openmmml/embedding/oniom.py).
 
         atomList = [int(i) for i in atoms]
         atomSet = set(atomList)
@@ -695,29 +690,6 @@ class MLPotential(object):
             a factory object that will be used to create MLPotentialImpl objects
         """
         MLPotential._implFactories[name] = factory
-
-
-def _system_is_periodic(system: openmm.System) -> bool:
-    """True if any Force in `system` reports usesPeriodicBoundaryConditions
-    or if a periodic NonbondedForce method is set."""
-    if system.usesPeriodicBoundaryConditions():
-        return True
-    periodic_methods = {
-        openmm.NonbondedForce.CutoffPeriodic,
-        openmm.NonbondedForce.Ewald,
-        openmm.NonbondedForce.PME,
-        openmm.NonbondedForce.LJPME,
-    }
-    for force in system.getForces():
-        if isinstance(force, openmm.NonbondedForce):
-            if force.getNonbondedMethod() in periodic_methods:
-                return True
-    return False
-
-
-def _topology_is_periodic(topology: openmm.app.Topology) -> bool:
-    """True if `topology.getPeriodicBoxVectors()` is set."""
-    return topology.getPeriodicBoxVectors() is not None
 
 
 # Register any potential functions defined by entry points.

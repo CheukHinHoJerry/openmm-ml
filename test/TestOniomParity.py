@@ -227,16 +227,19 @@ def _energy_and_forces(system, positions):
 # ---------------------------------------------------------------------------
 # Slice 3 parity tests
 #
-# Closed-valence + non-PBC only. PBC ONIOM is gated at createMixedSystem
-# level until the host MM PME / MACE GTO k-space functional-form mismatch
-# is resolved (Slice 5 of the plan).
+# Closed-valence (linkRecords=None). Both non-PBC and PBC are exercised:
+# the Slice 3 charge-zeroing surgery makes the PME contribution to every
+# ML-related pair zero (direct AND reciprocal, since the structure factor
+# over zero charges is zero), so the low-model only subtracts
+# ML-internal bonded + LJ, both Ewald-free.
 # ---------------------------------------------------------------------------
 
-def test_oniom_matches_electrostatic_energy_nonpbc(polar_mace_model_path):
+@pytest.mark.parametrize("periodic", [False, True], ids=["nonpbc", "pbc"])
+def test_oniom_matches_electrostatic_energy(polar_mace_model_path, periodic):
     """Total potential energy must match between the two modes within 1e-5
-    on a non-periodic 1-water-ML / 2-water-MM system."""
-    topology, system_a = _build_system(num_mm_waters=2, periodic=False)
-    _, system_b = _build_system(num_mm_waters=2, periodic=False)
+    on a 1-water-ML / 2-water-MM system, both non-periodic and periodic."""
+    topology, system_a = _build_system(num_mm_waters=2, periodic=periodic)
+    _, system_b = _build_system(num_mm_waters=2, periodic=periodic)
     potential = MLPotential("mace", modelPath=polar_mace_model_path)
     pos = _positions(num_mm_waters=2)
 
@@ -253,11 +256,11 @@ def test_oniom_matches_electrostatic_energy_nonpbc(polar_mace_model_path):
     assert e_oniom == pytest.approx(e_elec, rel=1e-5, abs=1e-3)
 
 
-def test_oniom_matches_electrostatic_forces_nonpbc(polar_mace_model_path):
-    """Per-atom forces must match between the two modes within 1e-3 kJ/mol/nm
-    on a non-periodic system."""
-    topology, system_a = _build_system(num_mm_waters=2, periodic=False)
-    _, system_b = _build_system(num_mm_waters=2, periodic=False)
+@pytest.mark.parametrize("periodic", [False, True], ids=["nonpbc", "pbc"])
+def test_oniom_matches_electrostatic_forces(polar_mace_model_path, periodic):
+    """Per-atom forces must match between the two modes."""
+    topology, system_a = _build_system(num_mm_waters=2, periodic=periodic)
+    _, system_b = _build_system(num_mm_waters=2, periodic=periodic)
     potential = MLPotential("mace", modelPath=polar_mace_model_path)
     pos = _positions(num_mm_waters=2)
 
@@ -274,17 +277,22 @@ def test_oniom_matches_electrostatic_forces_nonpbc(polar_mace_model_path):
     np.testing.assert_allclose(f_oniom, f_elec, rtol=1e-4, atol=1e-2)
 
 
-def test_oniom_rejects_periodic_system(polar_mace_model_path):
-    """PBC ONIOM is gated until the PME/GTO k-space mismatch is resolved
-    (Slice 5). The mode must raise NotImplementedError before any state
-    is mutated."""
+def test_oniom_translation_invariance(polar_mace_model_path):
+    """Shifting all positions by one full box vector preserves energy and
+    forces. Inherited from the underlying pieces -- the existing
+    electrostatic mode and MACE both have this property under PBC, and
+    Slice 3's charge-zeroing+low-model-correction inherits it."""
     topology, system = _build_system(num_mm_waters=2, periodic=True)
     potential = MLPotential("mace", modelPath=polar_mace_model_path)
-    with pytest.raises(NotImplementedError, match="non-periodic"):
-        potential.createMixedSystem(
-            topology, system, [0, 1, 2], embedding="oniom-electrostatic"
-        )
+    oniom = potential.createMixedSystem(
+        topology, system, [0, 1, 2], embedding="oniom-electrostatic"
+    )
+    pos = _positions(num_mm_waters=2)
+    e0, f0 = _energy_and_forces(oniom, pos)
 
-
-# A previous PBC translation-invariance test was removed when PBC ONIOM
-# was gated. Restore it once Slice 5 (purely-additive PME) lands.
+    shifted = (
+        pos.value_in_unit(unit.nanometer) + np.array([_BOX_NM, 0.0, 0.0])
+    ) * unit.nanometer
+    e1, f1 = _energy_and_forces(oniom, shifted)
+    assert e1 == pytest.approx(e0, rel=1e-6, abs=1e-4)
+    np.testing.assert_allclose(f1, f0, rtol=1e-5, atol=1e-3)

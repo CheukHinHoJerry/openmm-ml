@@ -213,15 +213,18 @@ class OniomLowModelBuilder:
             substituting it would leave a non-physical residual in the
             ONIOM cancellation. See module docstring and Slice 5.
         """
+        nb = self._find_nonbonded()
+        if nb is not None:
+            _raise_if_unsupported_coulomb_source(nb, "internal_nonbonded_force")
         return self._build_internal_pair_force(include_coulomb=True)
 
     def internal_lj_force(self) -> Optional[openmm.CustomBondForce]:
         """Return a `CustomBondForce` evaluating only ML-internal LJ.
 
-        Useful when the host `System` has already zeroed ML particle
-        charges (so the Coulomb term in `internal_nonbonded_force` would
-        be a no-op for the host but a non-zero subtraction in the
-        low-model — Slice 3 of the plan doc).
+        LJ has no Ewald split, so this method is safe under PBC. The
+        returned force inherits its periodicity from the source
+        `NonbondedForce`'s nonbonded method so ML-internal pairs use the
+        same displacement convention as the host.
         """
         return self._build_internal_pair_force(include_coulomb=False)
 
@@ -231,7 +234,6 @@ class OniomLowModelBuilder:
         nb = self._find_nonbonded()
         if nb is None:
             return None
-        _raise_if_unsupported_coulomb_source(nb, "internal_nonbonded_force")
 
         if include_coulomb:
             energy = (
@@ -245,8 +247,14 @@ class OniomLowModelBuilder:
             force.addPerBondParameter("chargeProd")
         force.addPerBondParameter("sigma")
         force.addPerBondParameter("epsilon")
-        # Non-PBC source by construction (the periodic case raised above);
-        # CustomBondForce keeps its default usesPeriodicBoundaryConditions=False.
+        # Inherit periodicity from the source so ML-internal pair tuples
+        # spanning the unit-cell boundary use the same displacement
+        # convention as the host MM system. (For include_coulomb=True the
+        # caller has already been gated by _raise_if_unsupported_coulomb_source;
+        # only LJ-only callers reach this with a periodic source.)
+        force.setUsesPeriodicBoundaryConditions(
+            nb.getNonbondedMethod() in _PERIODIC_NB_METHODS
+        )
 
         atom_charge, atom_sigma, atom_epsilon = self._read_particle_params(nb)
         exceptions = self._read_exceptions(nb)
