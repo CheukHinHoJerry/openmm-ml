@@ -18,31 +18,59 @@ these forces into a full ONIOM stack inside `MLPotential.createMixedSystem`.
 Conventions
 -----------
 - Coulomb conversion factor matches OpenMM (`138.935456 kJ/mol nm e^-2`).
-- ML-internal LJ and the **non-PBC** Coulomb pieces are evaluated in
-  direct space (`1/r`, no Ewald split). This matches the host MM
-  ``NonbondedForce`` when ``NonbondedMethod == NoCutoff`` and matches
-  MACE's ``_ml_mm_coulomb`` direct-pair-sum path.
-- **PBC Coulomb is intentionally not supported by this builder.** Under
-  PBC the host MM ``NonbondedForce`` uses PME (``erfc(αr)/r`` direct +
-  reciprocal Ewald), and MACE uses a GTO k-space evaluator
-  (``GTOElectrostaticEnergy`` from ``graph_longrange``). Neither
-  matches a static ``CustomBondForce`` / ``CustomNonbondedForce``
-  ``1/r`` form, so a Coulomb-bearing low-model under PBC would leave a
-  non-physical residual in the ONIOM cancellation. Under PBC the
-  Coulomb-bearing methods raise ``NotImplementedError`` pointing to
-  Slice 5 (purely-additive PME via the opposite-sign-PME trick).
-  ``internal_bonded_forces()`` remains valid under PBC because it
-  involves no Ewald split.
-- ML-MM Coulomb (non-PBC only) is evaluated as ``q_ml * q_mm / r``
-  summed over all ML-MM pairs that are NOT excluded by a
-  ``NonbondedForce`` exception in the source system (so the
-  subtraction matches what ``E_low(real)`` actually contains).
-- Bonded forces (HarmonicBond, HarmonicAngle, PeriodicTorsion) are
-  copied with terms restricted to ML-internal atom tuples and inherit
-  ``usesPeriodicBoundaryConditions()`` from the source.
 
-See https://github.com/CheukHinHoJerry/openmm-ml/issues for tracking
-the PBC limitation.
+- **Supported source NonbondedMethods (Coulomb-bearing methods).**
+  Only ``NoCutoff`` is supported. ML-internal LJ + Coulomb and the
+  ML-MM Coulomb background are emitted as direct-space ``1/r`` and
+  match the host MM ``NonbondedForce`` exactly when the host uses
+  ``NoCutoff``. Periodic methods (``PME`` / ``Ewald`` / ``CutoffPeriodic``
+  / ``LJPME``) and ``CutoffNonPeriodic`` are rejected with
+  ``NotImplementedError``:
+
+    * Periodic (PME / Ewald / LJPME / CutoffPeriodic) — the host's
+      Coulomb is ``erfc(αr)/r`` direct + reciprocal Ewald (or a periodic
+      hard cutoff). A ``CustomBondForce`` / ``CustomNonbondedForce``
+      ``1/r`` cannot reproduce that, and substituting it would leave a
+      non-physical residual in the ONIOM cancellation. PolarMACE itself
+      uses a separate GTO k-space evaluator (``GTOElectrostaticEnergy``
+      from ``graph_longrange``) under PBC, but matching MACE doesn't
+      help here — the low-model has to mirror the *MM* force field, not
+      MACE. Slice 5 of the plan handles this via the opposite-sign-PME
+      trick.
+    * ``CutoffNonPeriodic`` — OpenMM applies a reaction-field-style
+      truncation/shift to Coulomb under this method; a plain ``1/r``
+      cannot reproduce it. Use ``NoCutoff`` on the source, or strip the
+      cutoff before constructing the builder.
+
+- **Bonded methods (no Ewald split, no reaction field) are unaffected.**
+  ``internal_bonded_forces()`` always works regardless of the source
+  ``NonbondedForce`` method. Each copied force inherits
+  ``usesPeriodicBoundaryConditions()`` from its source, so bonded
+  tuples spanning the unit-cell boundary keep the same displacement
+  convention as the host.
+
+- **ML-MM Coulomb pair construction** (non-PBC, non-CutoffNonPeriodic):
+  ``q_ml * q_mm / r`` summed over all ML-MM pairs that are NOT excluded
+  by a ``NonbondedForce`` exception in the source system, so the
+  subtraction matches what ``E_low(real)`` actually contains.
+
+- **ML-internal LJ + Coulomb pair construction**: for each ML-ML pair,
+  ``sigma`` / ``epsilon`` / ``chargeProd`` come from a ``NonbondedForce``
+  exception when present, otherwise from per-particle parameters via
+  Lorentz-Berthelot mixing (``σ = ½(σᵢ+σⱼ)``, ``ε = √(εᵢεⱼ)``). Pairs
+  where both ``chargeProd`` and ``epsilon`` are zero are skipped.
+
+- **Unsupported bonded-like forces** (``CMAPTorsionForce``,
+  ``RBTorsionForce``, ``CustomBondForce`` / ``CustomAngleForce`` /
+  ``CustomTorsionForce``, ``CustomCompoundBondForce`` /
+  ``CustomCentroidBondForce``, ``AmoebaTorsionTorsionForce``,
+  ``GayBerneForce``) raise ``NotImplementedError`` rather than being
+  silently dropped, because their ML-internal entries would still be
+  evaluated by the host MM system and a missing low-model subtraction
+  would break the cancellation.
+
+See https://github.com/CheukHinHoJerry/openmm-ml/issues/9 for tracking
+the periodic / reaction-field Coulomb limitations.
 """
 from __future__ import annotations
 
