@@ -337,15 +337,6 @@ def test_ml_mm_coulomb_background_excludes_source_exceptions():
     assert e_test == pytest.approx(expected, rel=1e-9, abs=1e-9)
 
 
-def test_ml_mm_coulomb_background_periodic_explicit_no_cutoff_raises():
-    """If the caller forces periodic=True but the source has no cutoff and
-    none is supplied, raise rather than silently producing a broken force."""
-    source = _build_source_system()  # NoCutoff source has no cutoff distance
-    builder = OniomLowModelBuilder(source, _ML_ATOMS)
-    with pytest.raises(ValueError, match="cutoff"):
-        builder.ml_mm_coulomb_background_force(periodic=True)
-
-
 def _build_periodic_source_system():
     """5-atom system with PME NonbondedForce + cubic box; mirrors
     _build_source_system() but flips the nonbonded method to PME."""
@@ -369,32 +360,46 @@ def _build_periodic_source_system():
     return system
 
 
-def test_ml_mm_coulomb_background_auto_detects_periodicity_from_source():
-    """When the source NonbondedForce uses PME, the builder defaults to
-    CutoffPeriodic with the source's cutoff."""
-    source = _build_periodic_source_system()
-    builder = OniomLowModelBuilder(source, _ML_ATOMS)
-    cnb = builder.ml_mm_coulomb_background_force()
-    assert cnb is not None
-    assert cnb.getNonbondedMethod() == openmm.CustomNonbondedForce.CutoffPeriodic
-    assert cnb.getCutoffDistance().value_in_unit(unit.nanometer) == pytest.approx(
-        0.6, rel=1e-12
-    )
-
-
-def test_internal_nonbonded_force_inherits_pbc_from_source():
-    """ML-internal CustomBondForce must mirror the source NonbondedForce's
-    periodicity so ML-internal pairs use the same displacement convention
-    as the host."""
-    nonpbc_source = _build_source_system()
-    nonpbc_force = OniomLowModelBuilder(nonpbc_source, _ML_ATOMS).internal_nonbonded_force()
-    assert nonpbc_force is not None
-    assert nonpbc_force.usesPeriodicBoundaryConditions() is False
-
+def test_internal_nonbonded_force_raises_on_periodic_source():
+    """Coulomb-bearing low-model under PBC would not match host PME's
+    Ewald split, so the builder refuses rather than silently emitting a
+    1/r force. See module docstring + Slice 5 plan."""
     pbc_source = _build_periodic_source_system()
-    pbc_force = OniomLowModelBuilder(pbc_source, _ML_ATOMS).internal_nonbonded_force()
-    assert pbc_force is not None
-    assert pbc_force.usesPeriodicBoundaryConditions() is True
+    builder = OniomLowModelBuilder(pbc_source, _ML_ATOMS)
+    with pytest.raises(NotImplementedError, match="periodic"):
+        builder.internal_nonbonded_force()
+
+
+def test_ml_mm_coulomb_background_raises_on_periodic_source():
+    """Same gating as internal_nonbonded_force: PBC sources are refused."""
+    pbc_source = _build_periodic_source_system()
+    builder = OniomLowModelBuilder(pbc_source, _ML_ATOMS)
+    with pytest.raises(NotImplementedError, match="periodic"):
+        builder.ml_mm_coulomb_background_force()
+
+
+def test_ml_mm_coulomb_background_explicit_periodic_true_raises():
+    """Even on a non-PBC source, explicitly asking for periodic=True is
+    rejected -- there is no path to a meaningful periodic Coulomb here."""
+    source = _build_source_system()
+    builder = OniomLowModelBuilder(source, _ML_ATOMS)
+    with pytest.raises(NotImplementedError, match="periodic"):
+        builder.ml_mm_coulomb_background_force(periodic=True)
+
+
+def test_internal_bonded_forces_work_under_pbc():
+    """Bonded copies inherit usesPeriodicBoundaryConditions from the source
+    and remain valid under PBC."""
+    pbc_source = _build_periodic_source_system()
+    # Add a bonded force so the test is meaningful.
+    bonds = openmm.HarmonicBondForce()
+    bonds.setUsesPeriodicBoundaryConditions(True)
+    bonds.addBond(0, 1, 0.15 * unit.nanometer, 1000.0 * unit.kilojoule_per_mole / unit.nanometer ** 2)
+    pbc_source.addForce(bonds)
+    builder = OniomLowModelBuilder(pbc_source, _ML_ATOMS)
+    forces = builder.internal_bonded_forces()
+    bond_copy = next(f for f in forces if isinstance(f, openmm.HarmonicBondForce))
+    assert bond_copy.usesPeriodicBoundaryConditions() is True
 
 
 def test_unsupported_bonded_force_type_raises():
@@ -428,14 +433,9 @@ def test_unsupported_bonded_force_type_isinstance_check(force_factory, expected_
         builder.internal_bonded_forces()
 
 
-def test_ml_mm_coulomb_background_periodic_false_on_periodic_source_raises():
-    """Explicit periodic=False on a periodic (PME) source must raise --
-    silently producing a non-periodic 1/r force is the worst outcome
-    because it breaks ONIOM cancellation without any visible signal."""
-    source = _build_periodic_source_system()
-    builder = OniomLowModelBuilder(source, _ML_ATOMS)
-    with pytest.raises(ValueError, match="periodic=False"):
-        builder.ml_mm_coulomb_background_force(periodic=False)
+# test_ml_mm_coulomb_background_periodic_false_on_periodic_source_raises
+# was subsumed by test_ml_mm_coulomb_background_raises_on_periodic_source
+# once the Coulomb-bearing methods unconditionally reject PBC sources.
 
 
 # ---------------------------------------------------------------------------

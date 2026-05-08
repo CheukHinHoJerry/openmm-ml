@@ -18,15 +18,31 @@ these forces into a full ONIOM stack inside `MLPotential.createMixedSystem`.
 Conventions
 -----------
 - Coulomb conversion factor matches OpenMM (`138.935456 kJ/mol nm e^-2`).
-- ML-internal LJ and Coulomb are evaluated in **direct space** (`1/r`
-  with no Ewald split). MACE's ML-MM Coulomb is also direct-space, so
-  the two cancel exactly when both are present.
-- ML-MM Coulomb is evaluated as `q_ml * q_mm / r` summed over all ML-MM
-  pairs that are NOT excluded by a NonbondedForce exception in the
-  source system (so the subtraction matches what `E_low(real)` actually
-  contains).
+- ML-internal LJ and the **non-PBC** Coulomb pieces are evaluated in
+  direct space (`1/r`, no Ewald split). This matches the host MM
+  ``NonbondedForce`` when ``NonbondedMethod == NoCutoff`` and matches
+  MACE's ``_ml_mm_coulomb`` direct-pair-sum path.
+- **PBC Coulomb is intentionally not supported by this builder.** Under
+  PBC the host MM ``NonbondedForce`` uses PME (``erfc(αr)/r`` direct +
+  reciprocal Ewald), and MACE uses a GTO k-space evaluator
+  (``GTOElectrostaticEnergy`` from ``graph_longrange``). Neither
+  matches a static ``CustomBondForce`` / ``CustomNonbondedForce``
+  ``1/r`` form, so a Coulomb-bearing low-model under PBC would leave a
+  non-physical residual in the ONIOM cancellation. Under PBC the
+  Coulomb-bearing methods raise ``NotImplementedError`` pointing to
+  Slice 5 (purely-additive PME via the opposite-sign-PME trick).
+  ``internal_bonded_forces()`` remains valid under PBC because it
+  involves no Ewald split.
+- ML-MM Coulomb (non-PBC only) is evaluated as ``q_ml * q_mm / r``
+  summed over all ML-MM pairs that are NOT excluded by a
+  ``NonbondedForce`` exception in the source system (so the
+  subtraction matches what ``E_low(real)`` actually contains).
 - Bonded forces (HarmonicBond, HarmonicAngle, PeriodicTorsion) are
-  copied with terms restricted to ML-internal atom tuples.
+  copied with terms restricted to ML-internal atom tuples and inherit
+  ``usesPeriodicBoundaryConditions()`` from the source.
+
+See https://github.com/CheukHinHoJerry/openmm-ml/issues for tracking
+the PBC limitation.
 """
 from __future__ import annotations
 
@@ -150,10 +166,20 @@ class OniomLowModelBuilder:
         `interpolate=True` branch: for each ML-ML pair, sigma/epsilon/
         chargeProd come from a NonbondedForce exception when present,
         otherwise from the per-particle parameters via Lorentz-Berthelot.
+
+        Raises
+        ------
+        NotImplementedError
+            If the source `NonbondedForce` uses a periodic method
+            (PME / Ewald / CutoffPeriodic / LJPME). A direct-space `1/r`
+            CustomBondForce cannot reproduce PME's Ewald split, and
+            substituting it would leave a non-physical residual in the
+            ONIOM cancellation. See module docstring and Slice 5.
         """
         nb = self._find_nonbonded()
         if nb is None:
             return None
+        _raise_if_periodic_coulomb(nb, "internal_nonbonded_force")
 
         force = openmm.CustomBondForce(
             f"{COULOMB_KJ_NM}*chargeProd/r + 4*epsilon*((sigma/r)^12-(sigma/r)^6)"
@@ -161,13 +187,8 @@ class OniomLowModelBuilder:
         force.addPerBondParameter("chargeProd")
         force.addPerBondParameter("sigma")
         force.addPerBondParameter("epsilon")
-        # Match the host's periodicity. ML-internal pairs are usually
-        # inside one minimum image, but if the source NonbondedForce is
-        # periodic the host evaluates pairs with minimum-image
-        # displacement; the low-model must do the same to cancel.
-        force.setUsesPeriodicBoundaryConditions(
-            nb.getNonbondedMethod() in _PERIODIC_NB_METHODS
-        )
+        # Non-PBC source by construction (the periodic case raised above);
+        # CustomBondForce keeps its default usesPeriodicBoundaryConditions=False.
 
         atom_charge, atom_sigma, atom_epsilon = self._read_particle_params(nb)
         exceptions = self._read_exceptions(nb)
@@ -195,50 +216,36 @@ class OniomLowModelBuilder:
     ) -> Optional[openmm.CustomNonbondedForce]:
         """Return a `CustomNonbondedForce` for ML-MM direct-space Coulomb.
 
+        Non-PBC only. The PBC path is gated by `NotImplementedError`;
+        see the module docstring for the rationale (PME vs `1/r`
+        functional-form mismatch).
+
         Parameters
         ----------
         periodic : bool, optional
-            Whether the returned force should use `CutoffPeriodic`. If
-            `None` (default), the value is derived from the source
-            `NonbondedForce`'s nonbonded method.
+            Must be `False` or `None` (auto-derived from source). A
+            `True` value, or a periodic source, raises
+            `NotImplementedError`.
         cutoff : unit.Quantity, optional
-            Cutoff distance. If `None` (default), the value is read
-            from the source `NonbondedForce`'s `getCutoffDistance()`.
-            Required (effectively) when periodic=True; ignored when
-            periodic=False (a NoCutoff force is used).
-
-        Notes
-        -----
-        When the source uses `PME` / `Ewald` / `LJPME`, this force still
-        evaluates pure direct-space `1/r` (no Ewald split). The
-        reciprocal-space ML-MM contribution that PME computes in the
-        host is handled by Slice 5 of the ONIOM plan; in Slice 3 the
-        host zeroes ML charges so the reciprocal-space ML-* terms
-        vanish and the direct-space mismatch becomes immaterial.
+            Ignored under non-PBC (a NoCutoff force is produced).
         """
         nb = self._find_nonbonded()
         if nb is None:
             return None
+        _raise_if_periodic_coulomb(nb, "ml_mm_coulomb_background_force")
 
         src_is_periodic = nb.getNonbondedMethod() in _PERIODIC_NB_METHODS
         if periodic is None:
             periodic = src_is_periodic
-        # Reject explicit periodic=False on a periodic source: producing
-        # a NoCutoff 1/r force when the host MM system uses minimum-image
-        # PME would silently break the ONIOM cancellation.
-        if not periodic and src_is_periodic:
-            raise ValueError(
-                "Source NonbondedForce uses a periodic method but "
-                "periodic=False was passed explicitly. This combination "
-                "produces a non-periodic 1/r low-model that cannot cancel "
-                "the periodic host's ML-MM Coulomb."
+        if periodic:
+            raise NotImplementedError(
+                "ml_mm_coulomb_background_force(periodic=True) is not "
+                "supported. Direct-space 1/r cannot reproduce the host "
+                "MM PME / Ewald / LJPME split. See Slice 5 of the plan."
             )
-        # Only auto-fill cutoff from the source when the source itself is
-        # a periodic/cutoff method. NoCutoff sources still expose a
-        # default getCutoffDistance(), which would otherwise silently
-        # leak through; force the caller to be explicit.
-        if periodic and cutoff is None and src_is_periodic:
-            cutoff = nb.getCutoffDistance()
+        # cutoff is ignored under non-PBC: a NoCutoff CustomNonbondedForce
+        # is emitted below.
+        del cutoff
 
         atom_charge, _, _ = self._read_particle_params(nb)
         exceptions = self._read_exceptions(nb)
@@ -247,16 +254,7 @@ class OniomLowModelBuilder:
         force.addPerParticleParameter("charge")
         for i in range(self._num_particles):
             force.addParticle([atom_charge[i]])
-        if periodic:
-            if cutoff is None:
-                raise ValueError(
-                    "periodic=True requires a cutoff distance and the source "
-                    "NonbondedForce did not expose one."
-                )
-            force.setNonbondedMethod(openmm.CustomNonbondedForce.CutoffPeriodic)
-            force.setCutoffDistance(cutoff)
-        else:
-            force.setNonbondedMethod(openmm.CustomNonbondedForce.NoCutoff)
+        force.setNonbondedMethod(openmm.CustomNonbondedForce.NoCutoff)
 
         ml_atoms = set(self._ml)
         mm_atoms = [i for i in range(self._num_particles) if i not in ml_atoms]
@@ -359,6 +357,34 @@ class OniomLowModelBuilder:
             if all(int(p) in self._ml_set for p in (p1, p2, p3, p4)):
                 new.addTorsion(int(p1), int(p2), int(p3), int(p4), periodicity, phase, k)
         return new
+
+
+def _raise_if_periodic_coulomb(
+    nb: openmm.NonbondedForce, method_name: str
+) -> None:
+    """Gate the Coulomb-bearing low-model methods under PBC.
+
+    Under PBC the host MM `NonbondedForce` uses PME / Ewald / LJPME,
+    whose direct part is `erfc(αr)/r` and which carries a non-trivial
+    reciprocal-space tail. A static `CustomBondForce` /
+    `CustomNonbondedForce` `1/r` cannot reproduce that, so substituting
+    it would leave a non-physical residual in the ONIOM cancellation.
+    Slice 5 will handle PBC via the opposite-sign-PME trick.
+
+    `internal_lj_force()` and `internal_bonded_forces()` involve no
+    Ewald split and remain valid under PBC; only Coulomb-bearing
+    methods are gated.
+    """
+    if nb.getNonbondedMethod() in _PERIODIC_NB_METHODS:
+        raise NotImplementedError(
+            f"{method_name}() does not support a periodic source "
+            f"NonbondedForce (got method={nb.getNonbondedMethod()}). "
+            "PME / Ewald / LJPME hosts cannot be cancelled by a "
+            "direct-space 1/r low-model. Bonded copies remain valid "
+            "under PBC; for the full ONIOM stack on a periodic host, "
+            "wait for Slice 5 (purely-additive PME). See module "
+            "docstring for details."
+        )
 
 
 def _ordered_pair(i: int, j: int) -> Tuple[int, int]:
