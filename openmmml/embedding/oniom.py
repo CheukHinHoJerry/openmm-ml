@@ -65,6 +65,15 @@ _PERIODIC_NB_METHODS = frozenset(
 )
 
 
+# `CutoffNonPeriodic` applies a reaction-field-style cutoff to the source
+# MM Coulomb. A plain `1/r` low-model would not cancel that, so we refuse
+# to silently emit one. NoCutoff is the only non-periodic source we
+# currently support.
+_CUTOFF_NONPERIODIC_NB_METHODS = frozenset(
+    {openmm.NonbondedForce.CutoffNonPeriodic}
+)
+
+
 # Force classes that are "bonded-like" (their entries can refer to
 # ML-internal atom tuples that the closed-valence low-model would have
 # to subtract) but are not handled by `internal_bonded_forces`. The
@@ -179,7 +188,7 @@ class OniomLowModelBuilder:
         nb = self._find_nonbonded()
         if nb is None:
             return None
-        _raise_if_periodic_coulomb(nb, "internal_nonbonded_force")
+        _raise_if_unsupported_coulomb_source(nb, "internal_nonbonded_force")
 
         force = openmm.CustomBondForce(
             f"{COULOMB_KJ_NM}*chargeProd/r + 4*epsilon*((sigma/r)^12-(sigma/r)^6)"
@@ -232,7 +241,7 @@ class OniomLowModelBuilder:
         nb = self._find_nonbonded()
         if nb is None:
             return None
-        _raise_if_periodic_coulomb(nb, "ml_mm_coulomb_background_force")
+        _raise_if_unsupported_coulomb_source(nb, "ml_mm_coulomb_background_force")
 
         src_is_periodic = nb.getNonbondedMethod() in _PERIODIC_NB_METHODS
         if periodic is None:
@@ -359,32 +368,53 @@ class OniomLowModelBuilder:
         return new
 
 
-def _raise_if_periodic_coulomb(
+def _raise_if_unsupported_coulomb_source(
     nb: openmm.NonbondedForce, method_name: str
 ) -> None:
-    """Gate the Coulomb-bearing low-model methods under PBC.
+    """Gate the Coulomb-bearing low-model methods on source nonbonded methods
+    that a direct-space `1/r` low-model cannot cancel.
 
-    Under PBC the host MM `NonbondedForce` uses PME / Ewald / LJPME,
-    whose direct part is `erfc(αr)/r` and which carries a non-trivial
-    reciprocal-space tail. A static `CustomBondForce` /
-    `CustomNonbondedForce` `1/r` cannot reproduce that, so substituting
-    it would leave a non-physical residual in the ONIOM cancellation.
-    Slice 5 will handle PBC via the opposite-sign-PME trick.
+    Periodic sources (PME / Ewald / LJPME / CutoffPeriodic):
+        Direct part is `erfc(αr)/r` and there's a reciprocal-space tail
+        that no static `CustomBondForce` / `CustomNonbondedForce` `1/r`
+        can reproduce. Slice 5 will handle these via the opposite-sign-
+        PME trick.
+
+    `CutoffNonPeriodic` source:
+        OpenMM's NonbondedForce applies a reaction-field-style truncation
+        and shift to Coulomb under this method; a plain `1/r` would not
+        cancel it. Refuse rather than silently produce a wrong subtraction.
 
     `internal_lj_force()` and `internal_bonded_forces()` involve no
-    Ewald split and remain valid under PBC; only Coulomb-bearing
-    methods are gated.
+    Ewald split or reaction-field shift and remain valid even under
+    these source methods; only Coulomb-bearing methods are gated.
     """
-    if nb.getNonbondedMethod() in _PERIODIC_NB_METHODS:
+    method = nb.getNonbondedMethod()
+    if method in _PERIODIC_NB_METHODS:
         raise NotImplementedError(
             f"{method_name}() does not support a periodic source "
-            f"NonbondedForce (got method={nb.getNonbondedMethod()}). "
+            f"NonbondedForce (got method={method}). "
             "PME / Ewald / LJPME hosts cannot be cancelled by a "
             "direct-space 1/r low-model. Bonded copies remain valid "
             "under PBC; for the full ONIOM stack on a periodic host, "
             "wait for Slice 5 (purely-additive PME). See module "
             "docstring for details."
         )
+    if method in _CUTOFF_NONPERIODIC_NB_METHODS:
+        raise NotImplementedError(
+            f"{method_name}() does not support a CutoffNonPeriodic "
+            f"source NonbondedForce (got method={method}). "
+            "OpenMM applies a reaction-field-style truncation/shift to "
+            "Coulomb under this method, which a plain 1/r low-model "
+            "cannot reproduce. Use NonbondedMethod=NoCutoff on the "
+            "source, or strip the cutoff before constructing the "
+            "builder."
+        )
+
+
+# Backward-compatible alias for older internal callers / external code that
+# imported the helper before CutoffNonPeriodic was added.
+_raise_if_periodic_coulomb = _raise_if_unsupported_coulomb_source
 
 
 def _ordered_pair(i: int, j: int) -> Tuple[int, int]:
