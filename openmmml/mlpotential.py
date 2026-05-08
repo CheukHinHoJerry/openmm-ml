@@ -680,6 +680,31 @@ def _oniom_resolve_unsupported_bonded_like():
 _ONIOM_UNSUPPORTED_BONDED_LIKE = _oniom_resolve_unsupported_bonded_like()
 
 
+def _oniom_resolve_unsupported_nonbonded_like():
+    """Nonbonded-like Force classes the builder does not handle. The
+    builder supports `NonbondedForce` and `CustomNonbondedForce`; any
+    other nonbonded-like force present in the source is refused
+    because its ML-related contribution would not be subtracted by
+    the low-model and the ONIOM cancellation would silently break."""
+    names = (
+        "CustomGBForce",
+        "GBSAOBCForce",
+        "AmoebaMultipoleForce",
+        "AmoebaVdwForce",
+        "AmoebaWcaDispersionForce",
+        "AmoebaGeneralizedKirkwoodForce",
+        "DrudeForce",
+        "HippoNonbondedForce",
+        "ATMForce",
+    )
+    return tuple(
+        cls for cls in (getattr(openmm, n, None) for n in names) if cls is not None
+    )
+
+
+_ONIOM_UNSUPPORTED_NONBONDED_LIKE = _oniom_resolve_unsupported_nonbonded_like()
+
+
 def _build_oniom_model_system(
     source: openmm.System, ml_atoms: Iterable[int]
 ) -> openmm.System:
@@ -694,20 +719,24 @@ def _build_oniom_model_system(
          PeriodicTorsion) with entries restricted to ML-internal atom
          tuples. Each copy inherits `usesPeriodicBoundaryConditions()`
          from the source.
-      4. Re-add NonbondedForce as an opposite-sign-PME pair wrapped in
-         a `CustomCVForce` with energy `nb_a - nb_b`, where `nb_b` is
-         a clone with the existing electrostatic-mode surgery applied
-         (ML particle charges zeroed; ML-* exception chargeProds zeroed;
-         ML-ML exception epsilon zeroed). The subtraction yields exactly
-         the ML-related Coulomb + ML-internal LJ contributions; ML-MM LJ
-         and MM-MM cancel.
+      4. Re-add **every** ``NonbondedForce`` and ``CustomNonbondedForce``
+         from the source as an opposite-sign pair wrapped in a single
+         ``CustomCVForce`` whose energy is the sum of ``(a_i - b_i)``
+         over all clones. ``b_i`` clones get the ML-side surgery that
+         removes the ML-related contribution; ``a_i - b_i`` therefore
+         evaluates exactly the ML-related contribution of that source
+         force in matching functional form. Multiple source nonbonded
+         forces (alchemical / layered setups) are all handled.
 
     Raises
     ------
     NotImplementedError
         If the source contains any bonded-like force class the builder
         does not support (CMAPTorsion, RBTorsion, custom bond/angle/
-        torsion forces, etc.).
+        torsion forces, etc.) OR any nonbonded-like force class
+        beyond ``NonbondedForce`` / ``CustomNonbondedForce``
+        (e.g. ``CustomGBForce``, ``AmoebaMultipoleForce``,
+        ``DrudeForce``).
     """
     ml_set = set(int(i) for i in ml_atoms)
 
@@ -715,20 +744,28 @@ def _build_oniom_model_system(
     clone_xml = openmm.XmlSerializer.serialize(source)
     model = openmm.XmlSerializer.deserialize(clone_xml)
 
-    # Capture the source NonbondedForce *before* stripping (we'll need
-    # it for the opposite-sign clones).
-    source_nb = next(
-        (f for f in source.getForces() if isinstance(f, openmm.NonbondedForce)),
-        None,
-    )
+    # Collect every supported nonbonded-like source force in order.
+    source_nb_forces = [
+        f for f in source.getForces()
+        if isinstance(f, (openmm.NonbondedForce, openmm.CustomNonbondedForce))
+    ]
 
-    # Validate unsupported bonded-like classes BEFORE stripping so the
-    # error message reflects what the user actually has.
+    # Validate unsupported bonded-like AND nonbonded-like classes BEFORE
+    # stripping so the error message reflects what the user actually has.
     for src_force in source.getForces():
         if isinstance(src_force, _ONIOM_UNSUPPORTED_BONDED_LIKE):
             raise NotImplementedError(
                 f"embedding='oniom-electrostatic' does not support "
                 f"{type(src_force).__name__} in the source System. "
+                "Strip it before constructing the mixed system, or "
+                "extend the builder."
+            )
+        if isinstance(src_force, _ONIOM_UNSUPPORTED_NONBONDED_LIKE):
+            raise NotImplementedError(
+                f"embedding='oniom-electrostatic' does not support "
+                f"{type(src_force).__name__} in the source System. "
+                "The ONIOM low-model would silently miss its "
+                "ML-related contribution, breaking the cancellation. "
                 "Strip it before constructing the mixed system, or "
                 "extend the builder."
             )
@@ -778,22 +815,38 @@ def _build_oniom_model_system(
         # are intentionally not copied — the ONIOM low-model only
         # accounts for ML-internal bonded + ML-* nonbonded.
 
-    # 4. Re-add NonbondedForce via opposite-sign-PME pair, if source
-    # has one.
-    if source_nb is not None:
-        nb_xml = openmm.XmlSerializer.serialize(source_nb)
-        nb_a = openmm.XmlSerializer.deserialize(nb_xml)
-        nb_b = openmm.XmlSerializer.deserialize(nb_xml)
-        _oniom_apply_electrostatic_surgery(nb_b, ml_set)
-        cv = openmm.CustomCVForce("nb_a - nb_b")
-        cv.addCollectiveVariable("nb_a", nb_a)
-        cv.addCollectiveVariable("nb_b", nb_b)
+    # 4. Re-add every supported nonbonded-like source force as an
+    # opposite-sign pair inside a single CustomCVForce. The energy is
+    # the sum of (a_i - b_i) over all clones; each pair contributes
+    # exactly the ML-related portion of that source force.
+    if source_nb_forces:
+        cv = openmm.CustomCVForce("")
+        terms = []
+        for idx, src_force in enumerate(source_nb_forces):
+            nb_xml = openmm.XmlSerializer.serialize(src_force)
+            nb_a = openmm.XmlSerializer.deserialize(nb_xml)
+            nb_b = openmm.XmlSerializer.deserialize(nb_xml)
+            if isinstance(src_force, openmm.NonbondedForce):
+                _oniom_apply_nonbonded_surgery(nb_b, ml_set)
+            elif isinstance(src_force, openmm.CustomNonbondedForce):
+                _oniom_apply_custom_nonbonded_surgery(nb_b, ml_set)
+            else:
+                # Should not reach here; caught by the validation loop above.
+                raise NotImplementedError(
+                    f"unexpected nonbonded force class {type(src_force).__name__}"
+                )
+            a_name = f"nb_a_{idx}"
+            b_name = f"nb_b_{idx}"
+            cv.addCollectiveVariable(a_name, nb_a)
+            cv.addCollectiveVariable(b_name, nb_b)
+            terms.append(f"({a_name} - {b_name})")
+        cv.setEnergyFunction(" + ".join(terms))
         model.addForce(cv)
 
     return model
 
 
-def _oniom_apply_electrostatic_surgery(
+def _oniom_apply_nonbonded_surgery(
     force: openmm.NonbondedForce, ml_set: set
 ) -> None:
     """Apply the existing electrostatic-mode surgery to a NonbondedForce.
@@ -841,6 +894,38 @@ def _oniom_apply_electrostatic_surgery(
             if i_in_ml and j in ml_set:
                 epsilon = 0 * epsilon
             force.addException(i, j, 0, sigma, epsilon, True)
+
+
+def _oniom_apply_custom_nonbonded_surgery(
+    force: openmm.CustomNonbondedForce, ml_set: set
+) -> None:
+    """Apply the existing electrostatic-mode surgery to a CustomNonbondedForce.
+
+    Mirrors what the existing ``embedding="electrostatic"`` mode does
+    to the host (mlpotential.py L370-378): add an exclusion for every
+    ML-ML pair so the ML-internal contribution evaluates to zero in
+    the ``nb_b`` clone. ML-MM pairs are left as-is (they stay in the
+    host and are *not* subtracted by the low-model — analogous to the
+    treatment of ML-MM LJ in ``NonbondedForce``).
+
+    The ``nb_a - nb_b`` subtraction therefore yields exactly the
+    ML-internal CustomNonbondedForce energy.
+    """
+    existing = set()
+    for i in range(force.getNumExclusions()):
+        p1, p2 = force.getExclusionParticles(i)
+        existing.add(_oniom_ordered_pair(int(p1), int(p2)))
+
+    ml_list = sorted(ml_set)
+    for i_idx, i in enumerate(ml_list):
+        for j in ml_list[:i_idx]:
+            key = _oniom_ordered_pair(i, j)
+            if key not in existing:
+                force.addExclusion(i, j)
+
+
+def _oniom_ordered_pair(i: int, j: int):
+    return (i, j) if i < j else (j, i)
 
 
 def _make_oniom_low_model_closure(
