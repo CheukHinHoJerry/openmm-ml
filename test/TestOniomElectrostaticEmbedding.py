@@ -54,14 +54,39 @@ def _minimal_system_and_topology():
     return topology, system
 
 
-def test_create_mixed_system_with_oniom_raises_not_implemented():
-    """The mode is recognized at the API boundary and raises a clear
-    NotImplementedError pointing to the plan doc."""
+def test_create_mixed_system_with_oniom_closed_valence_returns_system():
+    """Slice 2′: closed-valence ONIOM returns a working System."""
     topology, system = _minimal_system_and_topology()
     potential = MLPotential("noop_oniom_test")
-    with pytest.raises(NotImplementedError, match="oniom-electrostatic"):
+    new_system = potential.createMixedSystem(
+        topology, system, [0, 1], embedding="oniom-electrostatic"
+    )
+    assert isinstance(new_system, openmm.System)
+    assert new_system.getNumParticles() == system.getNumParticles()
+
+
+def test_create_mixed_system_with_oniom_link_records_still_raises():
+    """Slice 2′: capped ONIOM (linkRecords != None) is still gated to
+    Slice 3′."""
+    topology, system = _minimal_system_and_topology()
+    potential = MLPotential("noop_oniom_test")
+    with pytest.raises(NotImplementedError, match="link-atom"):
         potential.createMixedSystem(
-            topology, system, [0, 1], embedding="oniom-electrostatic"
+            topology,
+            system,
+            [0, 1],
+            embedding="oniom-electrostatic",
+            linkRecords=[(0, 2, 0.109)],
+        )
+
+
+def test_create_mixed_system_with_oniom_no_atoms_raises_value_error():
+    """Caller must specify ml_atoms."""
+    topology, system = _minimal_system_and_topology()
+    potential = MLPotential("noop_oniom_test")
+    with pytest.raises(ValueError, match="ml-atoms"):
+        potential.createMixedSystem(
+            topology, system, None, embedding="oniom-electrostatic"
         )
 
 
