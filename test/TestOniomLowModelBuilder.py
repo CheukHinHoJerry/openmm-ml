@@ -115,6 +115,27 @@ def _strip_to_force_types(system, allowed):
 # Bonded tests
 # ---------------------------------------------------------------------------
 
+def test_internal_bonded_inherits_pbc_setting_from_source():
+    """Bonded copies must inherit usesPeriodicBoundaryConditions from the
+    source, otherwise a bonded tuple spanning the unit-cell boundary uses
+    different displacement (no PBC) in the low-model than in the host MM
+    system, and the cancellation breaks."""
+    for periodic in (False, True):
+        system = _build_source_system()
+        for f in system.getForces():
+            if isinstance(f, (openmm.HarmonicBondForce,
+                              openmm.HarmonicAngleForce,
+                              openmm.PeriodicTorsionForce)):
+                f.setUsesPeriodicBoundaryConditions(periodic)
+        builder = OniomLowModelBuilder(system, _ML_ATOMS)
+        forces = builder.internal_bonded_forces()
+        for f in forces:
+            assert f.usesPeriodicBoundaryConditions() is periodic, (
+                f"{type(f).__name__} did not inherit "
+                f"usesPeriodicBoundaryConditions={periodic}"
+            )
+
+
 def test_internal_bonded_keeps_only_ml_internal():
     system = _build_source_system()
     builder = OniomLowModelBuilder(system, _ML_ATOMS)
@@ -316,11 +337,105 @@ def test_ml_mm_coulomb_background_excludes_source_exceptions():
     assert e_test == pytest.approx(expected, rel=1e-9, abs=1e-9)
 
 
-def test_ml_mm_coulomb_background_periodic_requires_cutoff():
-    source = _build_source_system()
+def test_ml_mm_coulomb_background_periodic_explicit_no_cutoff_raises():
+    """If the caller forces periodic=True but the source has no cutoff and
+    none is supplied, raise rather than silently producing a broken force."""
+    source = _build_source_system()  # NoCutoff source has no cutoff distance
     builder = OniomLowModelBuilder(source, _ML_ATOMS)
     with pytest.raises(ValueError, match="cutoff"):
         builder.ml_mm_coulomb_background_force(periodic=True)
+
+
+def _build_periodic_source_system():
+    """5-atom system with PME NonbondedForce + cubic box; mirrors
+    _build_source_system() but flips the nonbonded method to PME."""
+    system = openmm.System()
+    system.setDefaultPeriodicBoxVectors(
+        openmm.Vec3(2.0, 0, 0) * unit.nanometer,
+        openmm.Vec3(0, 2.0, 0) * unit.nanometer,
+        openmm.Vec3(0, 0, 2.0) * unit.nanometer,
+    )
+    nb = openmm.NonbondedForce()
+    nb.setNonbondedMethod(openmm.NonbondedForce.PME)
+    nb.setCutoffDistance(0.6 * unit.nanometer)
+    for mass, charge, sigma, epsilon in _PARAMS:
+        system.addParticle(mass)
+        nb.addParticle(
+            charge * unit.elementary_charge,
+            sigma * unit.nanometer,
+            epsilon * unit.kilojoule_per_mole,
+        )
+    system.addForce(nb)
+    return system
+
+
+def test_ml_mm_coulomb_background_auto_detects_periodicity_from_source():
+    """When the source NonbondedForce uses PME, the builder defaults to
+    CutoffPeriodic with the source's cutoff."""
+    source = _build_periodic_source_system()
+    builder = OniomLowModelBuilder(source, _ML_ATOMS)
+    cnb = builder.ml_mm_coulomb_background_force()
+    assert cnb is not None
+    assert cnb.getNonbondedMethod() == openmm.CustomNonbondedForce.CutoffPeriodic
+    assert cnb.getCutoffDistance().value_in_unit(unit.nanometer) == pytest.approx(
+        0.6, rel=1e-12
+    )
+
+
+def test_internal_nonbonded_force_inherits_pbc_from_source():
+    """ML-internal CustomBondForce must mirror the source NonbondedForce's
+    periodicity so ML-internal pairs use the same displacement convention
+    as the host."""
+    nonpbc_source = _build_source_system()
+    nonpbc_force = OniomLowModelBuilder(nonpbc_source, _ML_ATOMS).internal_nonbonded_force()
+    assert nonpbc_force is not None
+    assert nonpbc_force.usesPeriodicBoundaryConditions() is False
+
+    pbc_source = _build_periodic_source_system()
+    pbc_force = OniomLowModelBuilder(pbc_source, _ML_ATOMS).internal_nonbonded_force()
+    assert pbc_force is not None
+    assert pbc_force.usesPeriodicBoundaryConditions() is True
+
+
+def test_unsupported_bonded_force_type_raises():
+    """Bonded-like force types the builder doesn't handle (e.g. CMAP) must
+    raise NotImplementedError so the low-model never silently omits them."""
+    source = _build_source_system()
+    cmap = openmm.CMAPTorsionForce()
+    source.addForce(cmap)
+    builder = OniomLowModelBuilder(source, _ML_ATOMS)
+    with pytest.raises(NotImplementedError, match="CMAPTorsionForce"):
+        builder.internal_bonded_forces()
+
+
+@pytest.mark.parametrize(
+    "force_factory,expected_name",
+    [
+        (lambda: openmm.CustomCompoundBondForce(2, "0"), "CustomCompoundBondForce"),
+        (lambda: openmm.CustomCentroidBondForce(2, "0"), "CustomCentroidBondForce"),
+        (lambda: openmm.RBTorsionForce(), "RBTorsionForce"),
+        (lambda: openmm.CustomTorsionForce("0"), "CustomTorsionForce"),
+    ],
+)
+def test_unsupported_bonded_force_type_isinstance_check(force_factory, expected_name):
+    """isinstance() catches Custom*Bond/CentroidBond/RB/CustomTorsion forces
+    too; not just the original CMAP case. Closes the silent-skip hole flagged
+    by the second-pass review."""
+    source = _build_source_system()
+    source.addForce(force_factory())
+    builder = OniomLowModelBuilder(source, _ML_ATOMS)
+    with pytest.raises(NotImplementedError, match=expected_name):
+        builder.internal_bonded_forces()
+
+
+def test_ml_mm_coulomb_background_periodic_false_on_periodic_source_raises():
+    """Explicit periodic=False on a periodic (PME) source must raise --
+    silently producing a non-periodic 1/r force is the worst outcome
+    because it breaks ONIOM cancellation without any visible signal."""
+    source = _build_periodic_source_system()
+    builder = OniomLowModelBuilder(source, _ML_ATOMS)
+    with pytest.raises(ValueError, match="periodic=False"):
+        builder.ml_mm_coulomb_background_force(periodic=False)
 
 
 # ---------------------------------------------------------------------------
