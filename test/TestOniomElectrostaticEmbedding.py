@@ -65,6 +65,24 @@ def test_create_mixed_system_with_oniom_raises_not_implemented():
         )
 
 
+def test_oniom_with_interpolate_true_raises_value_error():
+    """interpolate=True must raise ValueError BEFORE the
+    NotImplementedError so a future implementation cannot silently
+    fall through into the existing CustomCVForce interpolation path
+    (Codex finding #8 in the redesign plan).
+    """
+    topology, system = _minimal_system_and_topology()
+    potential = MLPotential("noop_oniom_test")
+    with pytest.raises(ValueError, match="interpolate=True"):
+        potential.createMixedSystem(
+            topology,
+            system,
+            [0, 1],
+            embedding="oniom-electrostatic",
+            interpolate=True,
+        )
+
+
 def test_unknown_embedding_still_rejected_at_mace_layer():
     """Unrelated bad values must still raise ValueError, not slip through
     as ONIOM."""

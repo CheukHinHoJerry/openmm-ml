@@ -303,13 +303,24 @@ class MLPotential(object):
         mergedArgs.update(args)
         embedding = mergedArgs.get('embedding')
         if embedding == 'oniom-electrostatic':
-            # Slice 1 of docs/codex-plans/electrostatic-oniom-implementation-plan.md.
+            # Reject interpolate=True up front so a future implementation
+            # cannot silently fall through into a CustomCVForce path that
+            # doesn't compose with the model-Context PythonForce design.
+            # See docs/codex-plans/electrostatic-oniom-redesign.md.
+            if interpolate:
+                raise ValueError(
+                    "interpolate=True is not supported with "
+                    "embedding='oniom-electrostatic'. The ONIOM low-model "
+                    "correction is added as a separate PythonForce, not "
+                    "inside the interpolation CustomCVForce."
+                )
+            # Slice 1 of docs/codex-plans/electrostatic-oniom-redesign.md.
             # The ONIOM-EE stack is not yet assembled; the API surface is
             # reserved here so callers can pin against the future behavior.
             raise NotImplementedError(
                 "embedding='oniom-electrostatic' is reserved but not yet "
                 "implemented. See docs/codex-plans/electrostatic-oniom-"
-                "implementation-plan.md for the planned slices."
+                "redesign.md for the planned slices."
             )
         electrostatic_embedding = embedding == 'electrostatic'
         if electrostatic_embedding and interpolate:
