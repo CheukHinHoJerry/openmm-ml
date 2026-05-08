@@ -156,7 +156,7 @@ def _add_water(system, nb, bonds, angles, params):
     )
 
 
-def _build_system(num_mm_waters):
+def _build_system(num_mm_waters, periodic=False):
     topology = app.Topology()
     chain = topology.addChain()
     for _ in range(1 + num_mm_waters):
@@ -166,18 +166,23 @@ def _build_system(num_mm_waters):
         a_h2 = topology.addAtom("H2", app.element.hydrogen, res)
         topology.addBond(a_o, a_h1)
         topology.addBond(a_o, a_h2)
-    topology.setPeriodicBoxVectors(
-        unit.Quantity(np.diag([_BOX_NM, _BOX_NM, _BOX_NM]), unit.nanometer)
-    )
+    if periodic:
+        topology.setPeriodicBoxVectors(
+            unit.Quantity(np.diag([_BOX_NM, _BOX_NM, _BOX_NM]), unit.nanometer)
+        )
     system = openmm.System()
-    system.setDefaultPeriodicBoxVectors(
-        openmm.Vec3(_BOX_NM, 0, 0) * unit.nanometer,
-        openmm.Vec3(0, _BOX_NM, 0) * unit.nanometer,
-        openmm.Vec3(0, 0, _BOX_NM) * unit.nanometer,
-    )
+    if periodic:
+        system.setDefaultPeriodicBoxVectors(
+            openmm.Vec3(_BOX_NM, 0, 0) * unit.nanometer,
+            openmm.Vec3(0, _BOX_NM, 0) * unit.nanometer,
+            openmm.Vec3(0, 0, _BOX_NM) * unit.nanometer,
+        )
     nb = openmm.NonbondedForce()
-    nb.setNonbondedMethod(openmm.NonbondedForce.PME)
-    nb.setCutoffDistance(0.5 * unit.nanometer)
+    if periodic:
+        nb.setNonbondedMethod(openmm.NonbondedForce.PME)
+        nb.setCutoffDistance(0.5 * unit.nanometer)
+    else:
+        nb.setNonbondedMethod(openmm.NonbondedForce.NoCutoff)
     bonds = openmm.HarmonicBondForce()
     angles = openmm.HarmonicAngleForce()
     o = (15.999, _O_CHARGE, _O_SIGMA, _O_EPS)
@@ -221,12 +226,17 @@ def _energy_and_forces(system, positions):
 
 # ---------------------------------------------------------------------------
 # Slice 3 parity tests
+#
+# Closed-valence + non-PBC only. PBC ONIOM is gated at createMixedSystem
+# level until the host MM PME / MACE GTO k-space functional-form mismatch
+# is resolved (Slice 5 of the plan).
 # ---------------------------------------------------------------------------
 
-def test_oniom_matches_electrostatic_energy(polar_mace_model_path):
-    """Total potential energy must match between the two modes within 1e-5."""
-    topology, system_a = _build_system(num_mm_waters=2)
-    _, system_b = _build_system(num_mm_waters=2)
+def test_oniom_matches_electrostatic_energy_nonpbc(polar_mace_model_path):
+    """Total potential energy must match between the two modes within 1e-5
+    on a non-periodic 1-water-ML / 2-water-MM system."""
+    topology, system_a = _build_system(num_mm_waters=2, periodic=False)
+    _, system_b = _build_system(num_mm_waters=2, periodic=False)
     potential = MLPotential("mace", modelPath=polar_mace_model_path)
     pos = _positions(num_mm_waters=2)
 
@@ -243,10 +253,11 @@ def test_oniom_matches_electrostatic_energy(polar_mace_model_path):
     assert e_oniom == pytest.approx(e_elec, rel=1e-5, abs=1e-3)
 
 
-def test_oniom_matches_electrostatic_forces(polar_mace_model_path):
-    """Per-atom forces must match between the two modes within 1e-3 kJ/mol/nm."""
-    topology, system_a = _build_system(num_mm_waters=2)
-    _, system_b = _build_system(num_mm_waters=2)
+def test_oniom_matches_electrostatic_forces_nonpbc(polar_mace_model_path):
+    """Per-atom forces must match between the two modes within 1e-3 kJ/mol/nm
+    on a non-periodic system."""
+    topology, system_a = _build_system(num_mm_waters=2, periodic=False)
+    _, system_b = _build_system(num_mm_waters=2, periodic=False)
     potential = MLPotential("mace", modelPath=polar_mace_model_path)
     pos = _positions(num_mm_waters=2)
 
@@ -263,18 +274,17 @@ def test_oniom_matches_electrostatic_forces(polar_mace_model_path):
     np.testing.assert_allclose(f_oniom, f_elec, rtol=1e-4, atol=1e-2)
 
 
-def test_oniom_translation_invariance(polar_mace_model_path):
-    """ONIOM must inherit PBC translation invariance from the underlying
-    pieces. Shifting all positions by one box vector preserves energy."""
-    topology, system = _build_system(num_mm_waters=2)
+def test_oniom_rejects_periodic_system(polar_mace_model_path):
+    """PBC ONIOM is gated until the PME/GTO k-space mismatch is resolved
+    (Slice 5). The mode must raise NotImplementedError before any state
+    is mutated."""
+    topology, system = _build_system(num_mm_waters=2, periodic=True)
     potential = MLPotential("mace", modelPath=polar_mace_model_path)
-    oniom = potential.createMixedSystem(
-        topology, system, [0, 1, 2], embedding="oniom-electrostatic"
-    )
-    pos = _positions(num_mm_waters=2)
-    e0, f0 = _energy_and_forces(oniom, pos)
+    with pytest.raises(NotImplementedError, match="non-periodic"):
+        potential.createMixedSystem(
+            topology, system, [0, 1, 2], embedding="oniom-electrostatic"
+        )
 
-    shifted = (pos.value_in_unit(unit.nanometer) + np.array([_BOX_NM, 0.0, 0.0])) * unit.nanometer
-    e1, f1 = _energy_and_forces(oniom, shifted)
-    assert e1 == pytest.approx(e0, rel=1e-6, abs=1e-4)
-    np.testing.assert_allclose(f1, f0, rtol=1e-5, atol=1e-3)
+
+# A previous PBC translation-invariance test was removed when PBC ONIOM
+# was gated. Restore it once Slice 5 (purely-additive PME) lands.
