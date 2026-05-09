@@ -274,6 +274,23 @@ def test_oniom_pbc_with_caps_raises_clearly():
     The error currently bubbles up from
     ``_prepareLinkRecords`` (used by both MACE and the ONIOM cap
     normalizer) which rejects ``is_periodic=True``.
+
+    Note: PBC + caps gating is layered. There are two independent
+    issues that block PBC support today:
+
+    1. **Cap placement formula** uses raw ``r_M - r_Q`` without
+       minimum-image. Cross-boundary Q-M cuts would put the cap in
+       the wrong place. This is what
+       ``_prepareLinkRecords`` currently fails on.
+    2. **Cap charge → PME residual** under PBC is bounded but
+       non-zero when ``q_cap ≠ 0``. ``_oniom_normalize_caps`` now
+       emits a ``UserWarning`` for this rather than raising, but the
+       upstream raise from (1) means no caller actually reaches the
+       warning code today.
+
+    Lifting PBC + caps requires both: (1) min-image cap placement in
+    ``openmmml/embedding/_links.py::compute_cap_positions``, and (2)
+    the warning path that's already in place for ``q_cap ≠ 0``.
     """
     topology, source = _build_two_residue_chain(periodic=True)
     potential = MLPotential("mm_as_mace_test")
@@ -281,7 +298,7 @@ def test_oniom_pbc_with_caps_raises_clearly():
         potential.createMixedSystem(
             topology, source, atoms=[0, 1, 2],
             embedding="oniom-electrostatic",
-            linkRecords=[(1, 3, 0.109)],
+            linkRecords=[(1, 3, 1.09)],
         )
 
 

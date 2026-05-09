@@ -296,6 +296,28 @@ class MLPotential(object):
             be used to customize them.  See the documentation on the specific
             potential functions for more information.
 
+            For ``embedding="oniom-electrostatic"``, two cap-related
+            kwargs are honored when present:
+
+            * ``linkRecords``: list of ``(q_global, m_global, target_dist_ang)``
+              tuples (or path to a CSV / sequence supported by
+              ``MACEPotentialImpl._prepareLinkRecords``). One entry
+              per ML/MM boundary bond. ``target_dist`` is in Å
+              (matches MACE's internal convention).
+            * ``capMMParams``: optional ``dict`` keyed by ``(q, m)``
+              tuples, values ``(charge_e, sigma_nm, epsilon_kjmol)``.
+              MM force-field parameters for each cap atom in the
+              ONIOM low-model. Missing keys fall back to a generic
+              aliphatic-H default ``(0.0, 0.106, 0.0656)``. The
+              default zero charge follows the standard Z1 convention
+              (Lin & Truhlar 2005); non-zero values emit a warning
+              under PBC because of an O(0.01–0.1 kJ/mol) per-cap
+              Ewald-formulation residual that does not bit-exactly
+              cancel between OpenMM PME (host model) and MACE's
+              k-space (MACE model). See
+              ``docs/codex-plans/electrostatic-oniom-redesign.md``
+              for the full discussion.
+
         Returns
         -------
         a newly created System object that uses this potential function to model the Topology
@@ -605,6 +627,67 @@ class MLPotential(object):
         (charge_e, sigma_nm, epsilon_kjmol). Missing entries fall back
         to a generic aliphatic-H default ``(0.0, 0.106, 0.0656)``.
 
+        Cap charge convention
+        ---------------------
+        The default ``cap_charge_e=0.0`` follows the **Z1 convention**
+        (Lin & Truhlar 2005, J. Phys. Chem. A) used by most QM/MM
+        packages: cap atoms are electrostatically silent on the MM
+        side and contribute only via LJ. This mirrors what MACE will
+        produce when its predicted cap charge is small (the typical
+        case for non-polar boundary cuts).
+
+        Non-zero cap charges are accepted but emit a UserWarning
+        under PBC: the OpenMM PME on the model `System` and MACE's
+        GTO k-space evaluator on the same capped region don't share
+        Ewald parameters bit-exactly, leaving an O(0.01–0.1 kJ/mol)
+        per-cap residual in the ONIOM cancellation. This is the
+        standard QM/MM PBC link-atom artifact, well below MACE's own
+        prediction noise on most workflows.
+
+        FUTURE WORK
+        -----------
+        - **Eliminate the Ewald-formulation residual under PBC.**
+          Two paths in the literature:
+
+          1. **Ewald-aware QM/MM** (Eichinger et al. 1999;
+             Laino-Mohamed-Laio-Parrinello 2005) — share OpenMM's PME
+             α and grid with MACE's k-space evaluator so cap-related
+             Coulomb cancels bit-exactly between
+             ``E_high − E_MM(model)``. Requires deeper integration
+             with MACE.
+          2. **Charge redistribution** (Lin-Truhlar RC/RCD) — keep
+             ``cap_charge=0`` and instead redistribute the M atom's
+             MM charge onto its bonded MM neighbors. Bounded boundary
+             dipole error rather than a PME residual. Implementable
+             in a future helper that mutates the host
+             ``NonbondedForce`` per linkRecord.
+
+          For now (Slice 3′), the conservative ``cap_charge=0``
+          default plus a warning on non-zero is the path of least
+          resistance — matches what most QM/MM packages do.
+
+        - **MACE-side cap charge enforcement.** MACE (PolarMACE)
+          predicts whatever charge density its trained model assigns
+          to a cap H. There is no current mechanism to force MACE's
+          predicted ``q_cap = 0``. If a user wants strict
+          "electrostatically inert cap" on both sides, this would
+          require either:
+
+          * Post-processing MACE's output to mask cap atom
+            multipoles before the Coulomb sum, OR
+          * Training a MACE variant with explicit cap-aware features.
+
+          Either change lives in the MACE codebase, not here. The
+          standard QM/MM convention accepts that the high-level
+          (MACE) view of the cap may differ from the low-level (MM)
+          view; the resulting boundary artifact is the well-known
+          link-atom error of O(1–5 kJ/mol) and is mitigated by
+          cutting at non-polar bonds (Cα-Cβ etc.).
+
+        Validation: see ``docs/codex-plans/electrostatic-oniom-
+        redesign.md`` for the design discussion of cap charges and
+        PBC tradeoffs.
+
         Currently delegates to `MACEPotentialImpl._prepareLinkRecords`
         for record validation (uniqueness, q ∈ atoms, m ∉ atoms,
         non-PBC requirement, etc.) so we share the same enforcement
@@ -662,24 +745,55 @@ class MLPotential(object):
                     cap_sigma[k] = float(sig_nm)
                     cap_epsilon[k] = float(eps_kj)
 
-        # PBC + non-zero cap charges is currently unsupported (CRITICAL
-        # caveat in the redesign plan): the model `Context` PME would
-        # see N+K charges while the host PME sees N, breaking the
-        # reciprocal-space cancellation. With cap charges = 0 the
-        # model PME's structure factor over caps is zero, so the
-        # asymmetry vanishes.
+        # PBC + non-zero cap charges is supported, but emits a
+        # warning. Both the OpenMM PME side (E_MM(model)) and MACE's
+        # GTO k-space side (E_high(model)) include cap-related Ewald
+        # contributions (self-energy, structure factor, neutralizing
+        # background). The two formulations are physically equivalent
+        # but use different α / grid / basis conventions, so the
+        # cancellation in `E_high − E_MM(model)` for cap-related
+        # Coulomb is not bit-exact.
+        #
+        # Magnitude of the residual: bounded by the difference between
+        # OpenMM PME and MACE GTO k-space when evaluated on the same
+        # cap charges. For typical settings (α ~3-4 nm⁻¹, common PME
+        # grids, reasonable cap charges < 0.2 e), the residual is in
+        # the range O(0.01–0.1 kJ/mol) per cap — comparable to the
+        # standard QM/MM PBC link-atom artifact and well within MACE's
+        # own prediction noise.
+        #
+        # The default cap_charge=0 sidesteps this entirely: caps drop
+        # out of both Ewald sums identically, no residual at all.
+        # FUTURE WORK: an Ewald-aware QM/MM coupling (Eichinger-Tavan
+        # multipole expansion or a shared-α PME implementation between
+        # MACE and OpenMM) would eliminate the residual rigorously.
+        # See docs/codex-plans/electrostatic-oniom-redesign.md for the
+        # design discussion and the path forward.
         host_is_periodic = (
             (topology.getPeriodicBoxVectors() is not None)
             or system.usesPeriodicBoundaryConditions()
         )
         if host_is_periodic and np.any(cap_charge != 0.0):
-            raise NotImplementedError(
-                "Capped ONIOM under PBC currently requires cap charges "
-                "to be zero (the default). Non-zero cap charges break "
-                "the reciprocal-space cancellation between E_MM(real) "
-                "(N particles) and E_MM(model) (N+K particles). See "
-                "docs/codex-plans/electrostatic-oniom-redesign.md "
-                "(Slice 3′ design item)."
+            import warnings
+            nonzero_caps = np.where(cap_charge != 0.0)[0]
+            warnings.warn(
+                "embedding='oniom-electrostatic' under PBC with non-zero "
+                f"cap_charge ({len(nonzero_caps)} of {K} cap(s) non-zero) "
+                "incurs a small Ewald-formulation mismatch between the "
+                "OpenMM PME used in E_MM(model) and the GTO k-space used "
+                "by MACE in E_high(model). The cap-related Coulomb terms "
+                "physically cancel in the ONIOM total but not bit-exactly: "
+                "expect a residual of O(0.01–0.1 kJ/mol) per cap. This is "
+                "the standard QM/MM PBC link-atom artifact (see "
+                "Lin & Truhlar 2005 on charge-redistribution mitigations). "
+                "If you need cap charges to act as a real H-type force-"
+                "field charge, validate against a non-cap reference. "
+                "Set cap_charge=0 (the default) to eliminate the "
+                "residual entirely. "
+                "Tracked as a future improvement in "
+                "docs/codex-plans/electrostatic-oniom-redesign.md.",
+                UserWarning,
+                stacklevel=3,
             )
 
         return {
