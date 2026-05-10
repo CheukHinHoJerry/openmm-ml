@@ -425,21 +425,6 @@ def _computeMACE(state, model, ptr, node_attrs, batch, pbc, returnEnergyType, ch
         inputDict["mm_source_batch"] = torch.zeros(
             len(mmInfo["mm_atoms"]), dtype=torch.long, device=ptr.device
         )
-    # Mask cap atoms out of MACE's electrostatic source-charge density
-    # so their contribution to all Coulomb sums is identically zero.
-    # This implements the standard QM/MM Z1 link-atom convention on
-    # the MACE side, matching the q_cap=0 convention on the MM side
-    # (openmm-ml's ONIOM-EE `_oniom_normalize_caps`). Caps remain real
-    # atoms for everything else MACE does (atomic energies, valence
-    # saturation in the message-passing graph, etc.); only their
-    # electrostatic source coefficients are zeroed.
-    if linkInfo is not None:
-        N_ml = len(indices)
-        K = int(linkInfo.get("K", 0))
-        if K > 0:
-            mask = torch.zeros(N_ml + K, dtype=torch.bool, device=ptr.device)
-            mask[N_ml:] = True
-            inputDict["virtual_hydrogen_mask"] = mask
     results = model(inputDict, compute_force=True)
     energy = float(results[returnEnergyType].detach())*energyScale
     forces = (results["forces"]*energyScale*lengthScale).detach().cpu().numpy()
