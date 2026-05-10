@@ -331,68 +331,55 @@ class MLPotential(object):
                 "the conventional MM endpoint."
             )
 
-        # Remove ML-internal bonded terms. In electrostatic embedding, ML/MM
-        # boundary bonded terms remain classical by default; only the classical
-        # electrostatics replaced by the ML/MM coupling are removed below.
-        # Classical ML-MM Lennard-Jones stays in the MM force field.
-
+        # Add nonbonded exceptions and exclusions.
         newSystem = self._removeBonds(system, atoms, True, removeConstraints)
-
         atomList = list(atoms)
-        for force in newSystem.getForces():
-            if isinstance(force, openmm.NonbondedForce):
-                if electrostatic_embedding:
-                    atomSet = set(atomList)
-                    numParticles = force.getNumParticles()
-                    for i in range(numParticles):
-                        charge, sigma, epsilon = force.getParticleParameters(i)
-                        if i in atomSet:
-                            # Zero only the direct Coulomb part on ML atoms.
-                            # Sigma/epsilon stay so ML-MM LJ survives.
-                            force.setParticleParameters(i, 0*charge, sigma, epsilon)
-                    existing = {}
-                    for i in range(force.getNumExceptions()):
-                        p1, p2, chargeProd, sigma, epsilon = force.getExceptionParameters(i)
-                        existing[(int(p1), int(p2))] = (chargeProd, sigma, epsilon)
-                    for i in range(numParticles):
-                        i_in_ml = i in atomSet
-                        for j in range(i):
-                            if not (i_in_ml or j in atomSet):
-                                continue
-                            key = (i, j)
-                            rev = (j, i)
-                            if key in existing:
-                                _, sigma, epsilon = existing[key]
-                            elif rev in existing:
-                                _, sigma, epsilon = existing[rev]
-                            else:
-                                _, sigma1, epsilon1 = force.getParticleParameters(i)
-                                _, sigma2, epsilon2 = force.getParticleParameters(j)
-                                sigma = 0.5*(sigma1+sigma2)
-                                epsilon = unit.sqrt(epsilon1*epsilon2)
-                            if i_in_ml and j in atomSet:
-                                epsilon = 0*epsilon
-                            force.addException(i, j, 0, sigma, epsilon, True)
-                else:
+
+        if embedding == 'mechanical':
+            for force in newSystem.getForces():
+                if isinstance(force, openmm.NonbondedForce):
                     for i in range(len(atomList)):
                         for j in range(i):
                             force.addException(atomList[i], atomList[j], 0, 1, 0, True)
-            elif isinstance(force, openmm.CustomNonbondedForce):
-                existing = set(tuple(force.getExclusionParticles(i)) for i in range(force.getNumExclusions()))
-                if electrostatic_embedding:
+                elif isinstance(force, openmm.CustomNonbondedForce):
+                    existing = set(tuple(force.getExclusionParticles(i)) for i in range(force.getNumExclusions()))
                     for i in range(len(atomList)):
                         a1 = atomList[i]
                         for j in range(i):
                             a2 = atomList[j]
                             if (a1, a2) not in existing and (a2, a1) not in existing:
                                 force.addExclusion(a1, a2)
-                else:
+        elif embedding == "electrostatic":
+            # ML-MM Coulomb is removed by zeroing the *particle* charge on every
+            # ML atom (globally). That kills:
+            #   - ML-ML Coulomb (handled by MACE/the ML potential)
+            #   - ML-MM Coulomb (handled by MACE in EE mode)
+            #   - reciprocal-space PME terms involving ML atoms
+            # without needing per-pair exceptions. LJ parameters on ML atoms are
+            # left intact so ML-MM Lennard-Jones is computed by the default
+            # NonbondedForce direct-space pair list -- crucially with PBC
+            # minimum-image, which `addException`-based pairwise terms are NOT.
+            # The only exceptions added below are for ML-ML pairs (chargeProd=0,
+            # epsilon=0): they exclude QM-internal classical nonbonded
+            # interactions, which MACE recomputes.
+            for force in newSystem.getForces():
+                if isinstance(force, openmm.NonbondedForce):
+                    for i in atomList:
+                        charge, sigma, epsilon = force.getParticleParameters(i)
+                        force.setParticleParameters(i, 0 * charge, sigma, epsilon)
+                    for i in range(len(atomList)):
+                        for j in range(i):
+                            force.addException(atomList[i], atomList[j], 0, 1, 0, True)
+                elif isinstance(force, openmm.CustomNonbondedForce):
+                    existing = set(tuple(force.getExclusionParticles(i)) for i in range(force.getNumExclusions()))
                     for i in range(len(atomList)):
                         a1 = atomList[i]
                         for j in range(i):
                             a2 = atomList[j]
                             if (a1, a2) not in existing and (a2, a1) not in existing:
                                 force.addExclusion(a1, a2)
+        else:
+            raise ValueError(f"Unsupported embedding type: {embedding}")
 
         # Add the ML potential.
 
