@@ -90,6 +90,19 @@ class MACEPotentialImpl(MLPotentialImpl):
     delta-independent floor in any finite-difference force check and
     apparent NVE drift in MD.
 
+    Precision caveat for ``returnEnergyType='energy'``: this key returns the
+    full ``total_energy = e0 + inter_e + extras`` where ``e0`` are the
+    model's per-atom reference energies. For foundation models (mace-mp,
+    mace-off, mace-omat, ...) ``e0`` is typically tens of eV per atom, so the
+    reported scalar for a large ML region can be 10⁴–10⁶ eV in magnitude.
+    The **forces** stay exact at any scale (they are gradients of this same
+    scalar), but the **energy** column written into single-precision OpenMM
+    state files / log lines may carry only ~6–7 significant digits at that
+    magnitude — meV resolution is lost. Use ``precision='double'`` if you
+    need accurate absolute energies, or note that energy differences (e.g.
+    NVE drift) still resolve cleanly because the e0 contribution cancels in
+    the difference. A runtime warning fires when this regime is detected.
+
     Attributes
     ----------
     name : str
@@ -209,6 +222,39 @@ class MACEPotentialImpl(MLPotentialImpl):
         if atoms is not None:
             includedAtoms = [includedAtoms[i] for i in atoms]
         atomicNumbers = [atom.element.atomic_number for atom in includedAtoms]
+
+        # Precision warning for returnEnergyType="energy".
+        # The 'energy' key is total_energy = e0 + inter_e + (PolarMACE extras).
+        # For models with non-trivial per-atom reference energies (mace-mp,
+        # mace-off, mace-omat foundations), e0 dominates the reported scalar
+        # — absolute values can reach 10^4–10^6 eV for large systems. That
+        # absolute scale is what gets written into single-precision OpenMM
+        # state/log lines, so the energy column may carry as few as 6–7
+        # significant digits and lose resolution at the meV level even though
+        # the *forces* (gradients of total_energy) remain accurate.
+        # Conservation/drift diagnostics still work (they're differences),
+        # but absolute-energy comparisons across runs need the model's e0
+        # baseline subtracted, or a double-precision report.
+        if returnEnergyType == "energy":
+            try:
+                e0 = model.atomic_energies_fn.atomic_energies
+                e0_max = float(e0.detach().abs().max())
+            except AttributeError:
+                e0_max = 0.0
+            if e0_max > 1.0:  # 1 eV per atom is conservative; foundation models far exceed this
+                import warnings as _w
+                _w.warn(
+                    f"returnEnergyType='energy' includes per-atom reference "
+                    f"energies (max |e0| = {e0_max:.2f} eV/atom over {int(e0.numel())} "
+                    f"element entries). For a {len(includedAtoms)}-atom ML region the "
+                    f"absolute reported energy scale can reach ~{e0_max * len(includedAtoms):.0f} "
+                    f"eV; single-precision floats will lose meV-level resolution at that "
+                    f"magnitude. Use precision='double' if you need accurate absolute "
+                    f"energies, or pass returnEnergyType='interaction_energy' for the "
+                    f"e0-subtracted readout (note: only 'energy' is gradient-consistent "
+                    f"with the reported forces for PolarMACE — see the docstring).",
+                    stacklevel=2,
+                )
 
         linkInfo = _prepareLinkRecords(linkRecords, atoms, topology, system)
         if linkInfo is not None:
