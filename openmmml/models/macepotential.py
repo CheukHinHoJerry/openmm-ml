@@ -377,19 +377,12 @@ def _computeMACE(state, model, ptr, node_attrs, batch, pbc, returnEnergyType, ch
     if linkInfo is not None:
         if indices is None:
             raise ValueError("linkRecords requires an explicit `atoms` subset.")
+        from openmmml.embedding._links import compute_cap_positions
         r_Q = positions_full[linkInfo["q_global"]]
         r_M = positions_full[linkInfo["m_global"]]
-        v = r_M - r_Q
-        s = np.linalg.norm(v, axis=1)
-        if np.any(s == 0.0):
-            raise ValueError("Link-atom Q and M coincident at this step.")
-        C_L = linkInfo["target_dist"] / s
-        if np.any(~np.isfinite(C_L)) or np.any(C_L <= 0.0) or np.any(C_L >= 1.0):
-            raise ValueError(
-                f"Link-atom C_L out of (0, 1) at runtime: {C_L}. "
-                "Check that target_dist < current |r_M - r_Q| for every cap."
-            )
-        pos_link = (1.0 - C_L)[:, None] * r_Q + C_L[:, None] * r_M
+        pos_link, _C_L_unused = compute_cap_positions(
+            r_Q, r_M, linkInfo["target_dist"]
+        )
         positions = np.concatenate([positions, pos_link], axis=0)
 
     if periodic:
@@ -443,27 +436,20 @@ def _computeMACE(state, model, ptr, node_attrs, batch, pbc, returnEnergyType, ch
         if linkInfo is None:
             f[indices] = forces
         else:
+            from openmmml.embedding._links import (
+                compute_cap_positions,
+                redistribute_cap_force,
+            )
             N = len(indices)
             f_ml = forces[:N]
             f_link = forces[N:]
             f[indices] = f_ml
             # Redistribute each link atom's force onto its (Q, M) partners.
-            # See _prepareLinkRecords for the bookkeeping. r_Q, r_M, s, C_L
-            # are recomputed here from positions_full (cheap; K is small).
+            # See _prepareLinkRecords for the bookkeeping.
             r_Q = positions_full[linkInfo["q_global"]]
             r_M = positions_full[linkInfo["m_global"]]
-            v = r_M - r_Q
-            s = np.linalg.norm(v, axis=1)
-            C_L = linkInfo["target_dist"] / s
-            if np.any(~np.isfinite(C_L)) or np.any(C_L <= 0.0) or np.any(C_L >= 1.0):
-                raise ValueError(
-                    f"Link-atom C_L out of (0, 1) at runtime: {C_L}. "
-                    "Check that target_dist < current |r_M - r_Q| for every cap."
-                )
-            e_b = v / s[:, None]
-            proj = np.einsum("ki,ki->k", f_link, e_b)
-            F_Q_add = (1.0 - C_L)[:, None] * f_link + (C_L * proj)[:, None] * e_b
-            F_M_add = C_L[:, None] * f_link - (C_L * proj)[:, None] * e_b
+            _, C_L = compute_cap_positions(r_Q, r_M, linkInfo["target_dist"])
+            F_Q_add, F_M_add = redistribute_cap_force(f_link, r_Q, r_M, C_L)
             # q_global and m_global were validated unique at construction, so
             # plain += is correct (no duplicate-row aggregation needed).
             f[linkInfo["q_global"]] += F_Q_add.astype(f.dtype, copy=False)
