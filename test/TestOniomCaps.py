@@ -319,3 +319,64 @@ def test_oniom_pbc_no_caps_still_works():
 
     assert e_mix == pytest.approx(e_real, rel=1e-9, abs=1e-8)
     np.testing.assert_allclose(f_mix, f_real, rtol=1e-7, atol=1e-7)
+
+
+# ---------------------------------------------------------------------------
+# Without-cap configuration parity for `oniom-electrostatic`
+#
+# Pin two no-cap behaviors of the new mode that don't depend on what
+# the ML potential returns:
+#   1. ``linkRecords=None`` and ``linkRecords`` omitted produce the
+#      same System (kwarg-parsing parity).
+#   2. ``capMMParams`` without ``linkRecords`` raises (validation).
+#
+# Note: a direct-energy parity check between ``embedding="electrostatic"``
+# and ``embedding="oniom-electrostatic"`` is NOT included here. The two
+# modes are equal only when the ML potential supplies the ML-MM Coulomb
+# coupling (real MACE in EE mode); the test stub ``mm_as_mace_test``
+# returns the isolated +E_MM(model) only, so by construction the totals
+# differ by E_MM(ML-MM Coulomb in real). That parity therefore needs an
+# integration test against a real EE-capable MLPotential, not a unit
+# test built on the local stub.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.parametrize("link_records_kwarg", [None, "omitted"])
+def test_no_caps_omitted_vs_explicit_none_linkrecords(link_records_kwarg):
+    """``linkRecords`` omitted vs ``linkRecords=None`` must produce
+    identical Systems. Pins that the kwarg-parsing path doesn't drift
+    behavior between the two ways a caller might "say no caps"."""
+    topology, source_a = _build_two_residue_chain(periodic=False)
+    _, source_b = _build_two_residue_chain(periodic=False)
+    potential = MLPotential("mm_as_mace_test")
+    pos = _positions_chain()
+
+    if link_records_kwarg == "omitted":
+        sys_a = potential.createMixedSystem(
+            topology, source_a, atoms=[0, 1, 2], embedding="oniom-electrostatic"
+        )
+    else:
+        sys_a = potential.createMixedSystem(
+            topology, source_a, atoms=[0, 1, 2], embedding="oniom-electrostatic",
+            linkRecords=None,
+        )
+    sys_ref = potential.createMixedSystem(
+        topology, source_b, atoms=[0, 1, 2], embedding="oniom-electrostatic"
+    )
+    e_a, f_a = _energy(sys_a, pos)
+    e_ref, f_ref = _energy(sys_ref, pos)
+    assert e_a == pytest.approx(e_ref, rel=1e-12, abs=1e-12)
+    np.testing.assert_allclose(f_a, f_ref, rtol=1e-12, atol=1e-12)
+
+
+def test_no_caps_capmmparams_without_linkrecords_raises():
+    """Validation: passing capMMParams without linkRecords is a user
+    error. Matches the existing error-path in
+    ``_oniom_normalize_caps``."""
+    topology, source = _build_two_residue_chain(periodic=False)
+    potential = MLPotential("mm_as_mace_test")
+    with pytest.raises(ValueError, match=r"capMMParams"):
+        potential.createMixedSystem(
+            topology, source, atoms=[0, 1, 2],
+            embedding="oniom-electrostatic",
+            capMMParams={(1, 3): (0.0, 0.106, 0.0656)},
+        )
