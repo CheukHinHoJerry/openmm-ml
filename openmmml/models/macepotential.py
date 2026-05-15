@@ -215,6 +215,11 @@ class MACEPotentialImpl(MLPotentialImpl):
             raise ValueError(f"Unsupported precision {precision} for the model. Supported values are 'single' and 'double'.")
         if dtype != modelDefaultDtype:
             print(f"Model dtype is {modelDefaultDtype} and requested dtype is {dtype}. The model will be converted to the requested dtype.")
+            # Actually do the conversion. The previous code only printed the
+            # warning and left the model untouched, which caused dtype
+            # mismatches inside e3nn's compiled TensorProduct submodules
+            # when inputs were passed at the requested dtype.
+            model = model.to(dtype)
 
         model_device = device
         try:
