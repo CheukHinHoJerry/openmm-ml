@@ -76,14 +76,19 @@ class MACEPotentialImpl(MLPotentialImpl):
     According to the MACE documentation, 'single' precision is recommended for MD (faster but
     less accurate), while 'double' precision is recommended for geometry optimization.
 
-    Additionally, you can request computation of the full atomic energy, including the atom
-    self-energy, instead of the default interaction energy, by setting ``returnEnergyType`` to
-    'energy'. For example:
-    
-    >>> system = potential.createSystem(topology, returnEnergyType='energy')
+    By default the reported energy is the full ``energy`` returned by the MACE
+    model — the same scalar whose gradient w.r.t. positions is reported as the
+    force, so the resulting potential is exactly conservative. To get only the
+    message-passing readout component, set ``returnEnergyType='interaction_energy'``:
 
-    The default is to compute the interaction energy, which can be made explicit by setting
-    ``returnEnergyType='interaction_energy'``.
+    >>> system = potential.createSystem(topology, returnEnergyType='interaction_energy')
+
+    Note: ``returnEnergyType='interaction_energy'`` is **not** energy/force
+    consistent for the PolarMACE family, which adds Coulomb / dipole / local-
+    electron terms to ``total_energy`` whose gradients are in ``forces`` but
+    which are not in ``interaction_energy``. Using it produces a non-zero,
+    delta-independent floor in any finite-difference force check and
+    apparent NVE drift in MD.
 
     Attributes
     ----------
@@ -117,7 +122,7 @@ class MACEPotentialImpl(MLPotentialImpl):
         atoms: Optional[Iterable[int]],
         forceGroup: int,
         precision: Optional[str] = None,
-        returnEnergyType: str = "interaction_energy",
+        returnEnergyType: str = "energy",
         linkRecords: LinkRecordsArg = None,
         embedding: str = "mechanical",
         **args,
@@ -139,8 +144,13 @@ class MACEPotentialImpl(MLPotentialImpl):
             The precision of the model. Supported options are 'single' and 'double'.
             If ``None``, the default precision of the model is used.
         returnEnergyType : str, optional
-            Whether to return the interaction energy or the energy including the self-energy.
-            Default is 'interaction_energy'. Supported options are 'interaction_energy' and 'energy'.
+            Which scalar from the MACE model output is reported to OpenMM as
+            the potential energy. Default ``'energy'`` is the same quantity
+            the force vector is differentiated against, so OpenMM sees a
+            self-consistent (conservative) potential. ``'interaction_energy'``
+            returns only the message-passing readout; for PolarMACE this is
+            **not** the gradient partner of ``forces`` and will produce
+            apparent NVE drift / a non-zero finite-difference plateau.
         linkRecords : str / path / sequence of (q_global, m_global, target_dist) / None
             Hydrogen link-atom cap records for QM/MM boundary bonds.
         embedding : {"mechanical", "electrostatic"}
