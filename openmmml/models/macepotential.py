@@ -76,14 +76,32 @@ class MACEPotentialImpl(MLPotentialImpl):
     According to the MACE documentation, 'single' precision is recommended for MD (faster but
     less accurate), while 'double' precision is recommended for geometry optimization.
 
-    Additionally, you can request computation of the full atomic energy, including the atom
-    self-energy, instead of the default interaction energy, by setting ``returnEnergyType`` to
-    'energy'. For example:
-    
-    >>> system = potential.createSystem(topology, returnEnergyType='energy')
+    By default the reported energy is the full ``energy`` returned by the MACE
+    model — the same scalar whose gradient w.r.t. positions is reported as the
+    force, so the resulting potential is exactly conservative. To get only the
+    message-passing readout component, set ``returnEnergyType='interaction_energy'``:
 
-    The default is to compute the interaction energy, which can be made explicit by setting
-    ``returnEnergyType='interaction_energy'``.
+    >>> system = potential.createSystem(topology, returnEnergyType='interaction_energy')
+
+    Note: ``returnEnergyType='interaction_energy'`` is **not** energy/force
+    consistent for the PolarMACE family, which adds Coulomb / dipole / local-
+    electron terms to ``total_energy`` whose gradients are in ``forces`` but
+    which are not in ``interaction_energy``. Using it produces a non-zero,
+    delta-independent floor in any finite-difference force check and
+    apparent NVE drift in MD.
+
+    Precision caveat for ``returnEnergyType='energy'``: this key returns the
+    full ``total_energy = e0 + inter_e + extras`` where ``e0`` are the
+    model's per-atom reference energies. For foundation models (mace-mp,
+    mace-off, mace-omat, ...) ``e0`` is typically tens of eV per atom, so the
+    reported scalar for a large ML region can be 10⁴–10⁶ eV in magnitude.
+    The **forces** stay exact at any scale (they are gradients of this same
+    scalar), but the **energy** column written into single-precision OpenMM
+    state files / log lines may carry only ~6–7 significant digits at that
+    magnitude — meV resolution is lost. Use ``precision='double'`` if you
+    need accurate absolute energies, or note that energy differences (e.g.
+    NVE drift) still resolve cleanly because the e0 contribution cancels in
+    the difference. A runtime warning fires when this regime is detected.
 
     Attributes
     ----------
@@ -117,7 +135,7 @@ class MACEPotentialImpl(MLPotentialImpl):
         atoms: Optional[Iterable[int]],
         forceGroup: int,
         precision: Optional[str] = None,
-        returnEnergyType: str = "interaction_energy",
+        returnEnergyType: str = "energy",
         linkRecords: LinkRecordsArg = None,
         embedding: str = "mechanical",
         **args,
@@ -139,8 +157,13 @@ class MACEPotentialImpl(MLPotentialImpl):
             The precision of the model. Supported options are 'single' and 'double'.
             If ``None``, the default precision of the model is used.
         returnEnergyType : str, optional
-            Whether to return the interaction energy or the energy including the self-energy.
-            Default is 'interaction_energy'. Supported options are 'interaction_energy' and 'energy'.
+            Which scalar from the MACE model output is reported to OpenMM as
+            the potential energy. Default ``'energy'`` is the same quantity
+            the force vector is differentiated against, so OpenMM sees a
+            self-consistent (conservative) potential. ``'interaction_energy'``
+            returns only the message-passing readout; for PolarMACE this is
+            **not** the gradient partner of ``forces`` and will produce
+            apparent NVE drift / a non-zero finite-difference plateau.
         linkRecords : str / path / sequence of (q_global, m_global, target_dist) / None
             Hydrogen link-atom cap records for QM/MM boundary bonds.
         embedding : {"mechanical", "electrostatic"}
@@ -199,6 +222,39 @@ class MACEPotentialImpl(MLPotentialImpl):
         if atoms is not None:
             includedAtoms = [includedAtoms[i] for i in atoms]
         atomicNumbers = [atom.element.atomic_number for atom in includedAtoms]
+
+        # Precision warning for returnEnergyType="energy".
+        # The 'energy' key is total_energy = e0 + inter_e + (PolarMACE extras).
+        # For models with non-trivial per-atom reference energies (mace-mp,
+        # mace-off, mace-omat foundations), e0 dominates the reported scalar
+        # — absolute values can reach 10^4–10^6 eV for large systems. That
+        # absolute scale is what gets written into single-precision OpenMM
+        # state/log lines, so the energy column may carry as few as 6–7
+        # significant digits and lose resolution at the meV level even though
+        # the *forces* (gradients of total_energy) remain accurate.
+        # Conservation/drift diagnostics still work (they're differences),
+        # but absolute-energy comparisons across runs need the model's e0
+        # baseline subtracted, or a double-precision report.
+        if returnEnergyType == "energy":
+            try:
+                e0 = model.atomic_energies_fn.atomic_energies
+                e0_max = float(e0.detach().abs().max())
+            except AttributeError:
+                e0_max = 0.0
+            if e0_max > 1.0:  # 1 eV per atom is conservative; foundation models far exceed this
+                import warnings as _w
+                _w.warn(
+                    f"returnEnergyType='energy' includes per-atom reference "
+                    f"energies (max |e0| = {e0_max:.2f} eV/atom over {int(e0.numel())} "
+                    f"element entries). For a {len(includedAtoms)}-atom ML region the "
+                    f"absolute reported energy scale can reach ~{e0_max * len(includedAtoms):.0f} "
+                    f"eV; single-precision floats will lose meV-level resolution at that "
+                    f"magnitude. Use precision='double' if you need accurate absolute "
+                    f"energies, or pass returnEnergyType='interaction_energy' for the "
+                    f"e0-subtracted readout (note: only 'energy' is gradient-consistent "
+                    f"with the reported forces for PolarMACE — see the docstring).",
+                    stacklevel=2,
+                )
 
         linkInfo = _prepareLinkRecords(linkRecords, atoms, topology, system)
         if linkInfo is not None:
