@@ -569,8 +569,17 @@ def test_link_charge_scheme_dz1_differs_from_z1(polar_mace_model_path):
 @pytest.mark.parametrize("scheme", ["none", "z1", "dz1"])
 def test_link_charge_scheme_fd_force_consistency(polar_mace_model_path, scheme):
     """For each scheme, the MACE-side forces must equal the negative gradient
-    of the MACE-side energy. Central finite difference on one QM atom; tight
-    tolerance because the system is small and we're in f64."""
+    of the MACE-side energy. Central finite difference on two QM atoms in f64.
+
+    Tolerance is intentionally loose (10 kJ/mol/nm): this runs against a
+    synthetic *untrained* MACE checkpoint whose local PES curvature is
+    arbitrary, so the central-difference truncation term is much larger than
+    on a trained model. The threshold is sized to catch a real
+    non-conservation regression (the `returnEnergyType='interaction_energy'`
+    bug fixed in PR #16 reproducibly showed |dF| in the hundreds of
+    kJ/mol/nm) while tolerating that synthetic-model noise floor. Do not
+    tighten without re-running against a trained model first.
+    """
     potential = MLPotential("mace", modelPath=polar_mace_model_path)
     _, ctx = _build_capped_mixed(potential, scheme=scheme)
 
@@ -599,13 +608,6 @@ def test_link_charge_scheme_fd_force_consistency(polar_mace_model_path, scheme):
             f_num = -(e_p - e_m) / (2.0 * delta)
             err = abs(f_num - f_ref[ia, ax])
             max_abs_err = max(max_abs_err, err)
-    # Tolerance: this is a smoke-level check on a synthetic untrained model
-    # whose local curvature is arbitrary; the central-difference truncation
-    # term can be several kJ/mol/nm. A real non-conservation regression
-    # (e.g. the broken returnEnergyType='interaction_energy' default we
-    # fixed in PR #16) would show |dF| in the hundreds of kJ/mol/nm
-    # consistently. Threshold chosen to catch that class of regression
-    # while tolerating the synthetic-model truncation noise floor.
     assert max_abs_err < 10.0, (
         f"FD vs analytical force mismatch for scheme='{scheme}': "
         f"max |dF| = {max_abs_err:.3e} kJ/mol/nm (expected < 10)"
