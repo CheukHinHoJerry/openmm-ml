@@ -137,7 +137,7 @@ class MACEPotentialImpl(MLPotentialImpl):
         precision: Optional[str] = None,
         returnEnergyType: str = "energy",
         linkRecords: LinkRecordsArg = None,
-        linkChargeScheme: str = "z1",
+        linkChargeScheme: str = "dz1",
         embedding: str = "mechanical",
         **args,
     ) -> None:
@@ -175,10 +175,12 @@ class MACEPotentialImpl(MLPotentialImpl):
             electronic structure. Supported in this iteration:
 
             - ``"none"``: leave MM charges untouched (legacy behaviour).
-            - ``"z1"`` (default): set q_M = 0 for every M atom. Cheapest fix;
-              breaks total MM-charge neutrality by -q_M_orig.
-            - ``"dz1"``: q_M = 0 plus q_M_orig is distributed equally onto M's
-              MM neighbours (M1 atoms). Preserves total MM charge to round-off.
+            - ``"z1"``: set q_M = 0 for every M atom. Cheapest fix; breaks
+              total MM-charge neutrality by -q_M_orig.
+            - ``"dz1"`` (default): q_M = 0 plus q_M_orig is distributed
+              equally onto M's MM neighbours (M1 atoms). Preserves total
+              MM charge to round-off. Falls back to Z1 (with a warning) for
+              any M atom that has zero MM neighbours.
 
             Only modifies the MM charge array passed to the ML potential;
             the OpenMM ``NonbondedForce`` is left untouched, so MM-MM Coulomb
