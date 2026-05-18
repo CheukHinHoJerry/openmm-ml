@@ -137,6 +137,7 @@ class MACEPotentialImpl(MLPotentialImpl):
         precision: Optional[str] = None,
         returnEnergyType: str = "energy",
         linkRecords: LinkRecordsArg = None,
+        linkChargeScheme: str = "z1",
         embedding: str = "mechanical",
         **args,
     ) -> None:
@@ -166,6 +167,24 @@ class MACEPotentialImpl(MLPotentialImpl):
             apparent NVE drift / a non-zero finite-difference plateau.
         linkRecords : str / path / sequence of (q_global, m_global, target_dist) / None
             Hydrogen link-atom cap records for QM/MM boundary bonds.
+        linkChargeScheme : str, optional
+            How to handle the partial charges on the MM-side boundary atoms
+            (M atoms) when ``linkRecords`` is provided. The M-atom partial
+            charge would otherwise sit ~1.5 Å from the nearest QM atom (through
+            the link H) and over-polarise the QM region's MACE-predicted
+            electronic structure. Supported in this iteration:
+
+            - ``"none"``: leave MM charges untouched (legacy behaviour).
+            - ``"z1"`` (default): set q_M = 0 for every M atom. Cheapest fix;
+              breaks total MM-charge neutrality by -q_M_orig.
+            - ``"dz1"``: q_M = 0 plus q_M_orig is distributed equally onto M's
+              MM neighbours (M1 atoms). Preserves total MM charge to round-off.
+
+            Only modifies the MM charge array passed to the ML potential;
+            the OpenMM ``NonbondedForce`` is left untouched, so MM-MM Coulomb
+            is bit-exact with the original force field (standard QM/MM
+            practice). Z2 and RCD (which require per-step virtual charges)
+            are not in this iteration.
         embedding : {"mechanical", "electrostatic"}
             Mixed-system embedding mode for local PolarMACE models. ``mechanical``
             preserves the previous behavior: MM positions/charges are not passed
@@ -298,6 +317,27 @@ class MACEPotentialImpl(MLPotentialImpl):
             # embedding='electrostatic'. We only need MM positions/charges for
             # the PolarMACE input here.
             mmInfo = _prepareMMEmbedding(system, atoms)
+
+            # Optional Z1 / DZ1 link-atom charge redistribution. Standard QM/MM
+            # correction to stop the QM region from being over-polarised by
+            # the partial charge on the MM-side boundary atom (M atom) sitting
+            # ~1.5 Å from the link H. Only modifies the *constant* mm_charges
+            # array baked into the PythonForce closure; does not touch the
+            # OpenMM NonbondedForce, so MM-MM Coulomb stays bit-exact with the
+            # original FF (standard practice).
+            if linkInfo is not None and linkChargeScheme not in (None, "none"):
+                from openmmml.embedding._links import (
+                    apply_link_charge_redistribution as _apply_link_q,
+                )
+                mmInfo["mm_charges"] = _apply_link_q(
+                    mm_atoms=mmInfo["mm_atoms"],
+                    mm_charges=mmInfo["mm_charges"],
+                    link_info=linkInfo,
+                    topology=topology,
+                    scheme=linkChargeScheme,
+                )
+                print(f"[link-charge-redistribution] scheme={linkChargeScheme}  "
+                      f"M atoms touched={len(linkInfo['m_global'])}")
         periodic = (topology.getPeriodicBoxVectors() is not None) or system.usesPeriodicBoundaryConditions()
 
         compute = partial(_computeMACE,
