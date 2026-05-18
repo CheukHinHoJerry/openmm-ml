@@ -458,3 +458,157 @@ def test_polar_mace_electrostatic_mm_charge_displacement_changes_ml_force(
     # responds to the shifted MM field.
     delta_ml = f_b[:3] - f_a[:3]
     assert np.linalg.norm(delta_ml) > 1e-3
+
+
+# ---------------------------------------------------------------------------
+# Link-atom CHARGE redistribution (Z1 / DZ1) — end-to-end via MACE
+# ---------------------------------------------------------------------------
+#
+# The unit tests in TestLinkChargeRedistribution.py cover the pure helper
+# (apply_link_charge_redistribution). The tests below exercise the actual
+# integration into MACEPotentialImpl.addForces and verify that:
+#   (a) the scheme parameter propagates all the way to MACE's mm_charges
+#       input (different schemes give different energies/forces);
+#   (b) forces remain conservative under each scheme (F = -dE/dx, FD-tested).
+
+
+def _build_capped_nonpbc_chain():
+    """Tiny 6-atom chain: ML region {0,1,2} bonded to MM atom 3 (the M atom)
+    which is bonded to MM atoms {4,5} (M's neighbours, for DZ1 to populate).
+    All MM atoms carry non-zero partial charges so the linkChargeScheme has
+    something to redistribute.
+    """
+    system = openmm.System()
+    # Make all six atoms hydrogen (element 1) so MACE's atomic-number map
+    # exercised by the polar_mace_model_path fixture works (it knows H+O only).
+    for _ in range(6):
+        system.addParticle(1.0)
+    nb = openmm.NonbondedForce()
+    # ML atoms get zero charge (they'll be re-zeroed by createMixedSystem anyway,
+    # but make it explicit). MM atoms get something the scheme can act on.
+    nb.addParticle(0.0,  0.30, 0.20)   # 0  ML
+    nb.addParticle(0.0,  0.30, 0.20)   # 1  ML
+    nb.addParticle(0.0,  0.30, 0.20)   # 2  ML  (Q atom in the cut)
+    nb.addParticle(-0.40, 0.30, 0.20)  # 3  MM  (the M atom)
+    nb.addParticle(0.15, 0.30, 0.20)   # 4  MM  (M1 neighbour)
+    nb.addParticle(0.25, 0.30, 0.20)   # 5  MM  (M1 neighbour)
+    nb.setNonbondedMethod(openmm.NonbondedForce.NoCutoff)
+    system.addForce(nb)
+
+    topology = app.Topology()
+    chain = topology.addChain()
+    res = topology.addResidue("X", chain)
+    atoms = [topology.addAtom(f"H{i}", elem.hydrogen, res) for i in range(6)]
+    # Bonds: 0-1, 1-2, 2-3 (Q-M cut), 3-4 (M-M1), 3-5 (M-M1)
+    for a, b in [(0, 1), (1, 2), (2, 3), (3, 4), (3, 5)]:
+        topology.addBond(atoms[a], atoms[b])
+    return topology, system
+
+
+def _capped_chain_positions():
+    return np.array([
+        [0.00, 0.0, 0.0],
+        [0.11, 0.0, 0.0],
+        [0.22, 0.0, 0.0],
+        [0.33, 0.0, 0.0],   # M atom
+        [0.40, 0.07, 0.0],  # M1
+        [0.40, -0.07, 0.0], # M1
+    ]) * unit.nanometer
+
+
+def _build_capped_mixed(potential, scheme):
+    topology, mm_system = _build_capped_nonpbc_chain()
+    mixed = potential.createMixedSystem(
+        topology, mm_system, atoms=[0, 1, 2],
+        embedding="electrostatic",
+        linkRecords=[(2, 3, 1.09)],   # Q=2 (in ML), M=3 (MM)
+        linkChargeScheme=scheme,
+    )
+    plat = openmm.Platform.getPlatformByName("Reference")
+    ctx = openmm.Context(mixed, openmm.VerletIntegrator(0.001), plat)
+    ctx.setPositions(_capped_chain_positions())
+    return mixed, ctx
+
+
+# elem import for the topology builder; sits with the openmm.app namespace.
+from openmm.app import element as elem  # noqa: E402  (kept near point of use)
+
+
+def test_link_charge_scheme_z1_changes_energy_vs_none(polar_mace_model_path):
+    """linkChargeScheme='z1' zeros the M-atom partial charge before it
+    reaches MACE. Versus 'none' (M keeps its full ff charge) the ML-MM
+    Coulomb term changes, so the total ML energy must change too."""
+    potential = MLPotential("mace", modelPath=polar_mace_model_path)
+    _, ctx_none = _build_capped_mixed(potential, scheme="none")
+    e_none, f_none = _energy_and_forces(ctx_none)
+    _, ctx_z1   = _build_capped_mixed(potential, scheme="z1")
+    e_z1, f_z1 = _energy_and_forces(ctx_z1)
+    assert np.isfinite(e_none) and np.isfinite(e_z1)
+    # Must differ by more than f64 round-off but well within ML-energy scale.
+    assert abs(e_z1 - e_none) > 1e-3, (
+        f"linkChargeScheme='z1' should differ from 'none' (got Δ={e_z1-e_none:.3e})"
+    )
+    assert np.linalg.norm(f_z1[:3] - f_none[:3]) > 1e-3
+
+
+def test_link_charge_scheme_dz1_differs_from_z1(polar_mace_model_path):
+    """DZ1 zeros the M atom AND adds q_M_orig/N to each MM neighbour. With
+    different MM-charge spatial distribution the ML region's MACE input
+    differs from Z1, so the ML energy/forces must differ too."""
+    potential = MLPotential("mace", modelPath=polar_mace_model_path)
+    _, ctx_z1  = _build_capped_mixed(potential, scheme="z1")
+    e_z1, _   = _energy_and_forces(ctx_z1)
+    _, ctx_dz = _build_capped_mixed(potential, scheme="dz1")
+    e_dz, _  = _energy_and_forces(ctx_dz)
+    assert abs(e_dz - e_z1) > 1e-4, (
+        f"DZ1 should differ from Z1 (M1 atoms saw redistributed charge); "
+        f"got Δ={e_dz-e_z1:.3e}"
+    )
+
+
+@pytest.mark.parametrize("scheme", ["none", "z1", "dz1"])
+def test_link_charge_scheme_fd_force_consistency(polar_mace_model_path, scheme):
+    """For each scheme, the MACE-side forces must equal the negative gradient
+    of the MACE-side energy. Central finite difference on two QM atoms in f64.
+
+    Tolerance is intentionally loose (10 kJ/mol/nm): this runs against a
+    synthetic *untrained* MACE checkpoint whose local PES curvature is
+    arbitrary, so the central-difference truncation term is much larger than
+    on a trained model. The threshold is sized to catch a real
+    non-conservation regression (the `returnEnergyType='interaction_energy'`
+    bug fixed in PR #16 reproducibly showed |dF| in the hundreds of
+    kJ/mol/nm) while tolerating that synthetic-model noise floor. Do not
+    tighten without re-running against a trained model first.
+    """
+    potential = MLPotential("mace", modelPath=polar_mace_model_path)
+    _, ctx = _build_capped_mixed(potential, scheme=scheme)
+
+    pos0 = _capped_chain_positions().value_in_unit(unit.nanometer).copy()
+    delta = 5e-5  # nm  (= 5e-4 Å, near the FD valley minimum for synthetic models)
+
+    ctx.setPositions(pos0 * unit.nanometer)
+    e_ref = ctx.getState(getEnergy=True).getPotentialEnergy().value_in_unit(
+        unit.kilojoules_per_mole)
+    f_ref = ctx.getState(getForces=True).getForces(asNumpy=True).value_in_unit(
+        unit.kilojoules_per_mole / unit.nanometer)
+
+    max_abs_err = 0.0
+    for ia in (0, 1):           # two QM atoms
+        for ax in range(3):
+            saved = pos0[ia, ax]
+            pos0[ia, ax] = saved + delta
+            ctx.setPositions(pos0 * unit.nanometer)
+            e_p = ctx.getState(getEnergy=True).getPotentialEnergy().value_in_unit(
+                unit.kilojoules_per_mole)
+            pos0[ia, ax] = saved - delta
+            ctx.setPositions(pos0 * unit.nanometer)
+            e_m = ctx.getState(getEnergy=True).getPotentialEnergy().value_in_unit(
+                unit.kilojoules_per_mole)
+            pos0[ia, ax] = saved
+            f_num = -(e_p - e_m) / (2.0 * delta)
+            err = abs(f_num - f_ref[ia, ax])
+            max_abs_err = max(max_abs_err, err)
+    assert max_abs_err < 10.0, (
+        f"FD vs analytical force mismatch for scheme='{scheme}': "
+        f"max |dF| = {max_abs_err:.3e} kJ/mol/nm (expected < 10)"
+    )
