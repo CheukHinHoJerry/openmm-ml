@@ -1294,6 +1294,9 @@ def _make_oniom_low_model_closure(
                 else np.asarray(host_positions)
             r_Q = host_pos_nm[cap_info["q_global"]]
             r_M = host_pos_nm[cap_info["m_global"]]
+            # `cap_info["target_dist"]` is stored in nm by
+            # `_oniom_normalize_caps` (which converts Å→nm out of
+            # linkInfo); `r_Q`, `r_M` are in nm. No conversion needed.
             cap_pos, cap_C_L = compute_cap_positions(
                 r_Q, r_M, cap_info["target_dist"]
             )
