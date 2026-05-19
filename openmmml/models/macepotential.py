@@ -593,10 +593,15 @@ def _prepareLinkRecords(linkRecords, atoms, topology, system):
         from mlmm.link_atoms import load_link_records
         recs = load_link_records(linkRecords)
         # capping_mapping.csv is 1-based; convert to 0-based OpenMM indices.
-        # target_dist is stored in Angstroms (column name target_dist_ang); the
-        # runtime check compares to |r_M - r_Q| in OpenMM nm — convert here.
-        tuples = [(r.q_idx1 - 1, r.m_idx1 - 1, r.target_dist * 0.1) for r in recs]
+        # target_dist comes in via the CSV's `target_dist_ang` column;
+        # linkInfo stores it in Angstroms (canonical — matches MACE-side
+        # `positions_full` in Å). The oniom-electrostatic closure converts
+        # Å→nm at the point of use because its positions are in nm.
+        tuples = [(r.q_idx1 - 1, r.m_idx1 - 1, r.target_dist) for r in recs]
     else:
+        # Tuple path: target_dist is also in Å (matches the docstring
+        # parameter name `target_dist_ang` and the MACE convention used
+        # in every upstream test fixture, e.g. linkRecords=[(q, m, 1.09)]).
         tuples = [(int(q), int(m), float(td)) for (q, m, td) in linkRecords]
 
     if not tuples:
