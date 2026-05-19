@@ -1071,11 +1071,7 @@ def _build_oniom_model_system(
         # Cap atom indices are appended at the end: N..N+K-1.
         cap_info_local = dict(cap_info)
         cap_info_local["model_indices"] = np.asarray(cap_atom_indices, dtype=np.int64)
-        # Treat cap atoms as ML for the surgery (cap-* contributions
-        # need to be subtracted from the host the same way ML-* are).
-        ml_set_with_caps = ml_set | set(int(i) for i in cap_atom_indices)
     else:
-        ml_set_with_caps = ml_set
         cap_info_local = None
 
     # 4. Re-add every supported nonbonded-like source force as an
@@ -1117,9 +1113,17 @@ def _build_oniom_model_system(
                         nb_a.addParticle([0.0] * nb_a_per_particle)
                         nb_b.addParticle([0.0] * nb_b_per_particle)
             if isinstance(src_force, openmm.NonbondedForce):
-                _oniom_apply_nonbonded_surgery(nb_b, ml_set_with_caps)
+                # Surgery on the real ML set only. Cap atoms (indices
+                # N..N+K-1) are appended with identical parameters to
+                # nb_a and nb_b and are NOT touched by the surgery —
+                # so every cap-involved Coulomb / LJ term cancels in
+                # (a - b). This matches the additive electrostatic
+                # mode, which never inserts cap atoms into the host
+                # NonbondedForce in the first place (MACE handles all
+                # cap chemistry on the high side).
+                _oniom_apply_nonbonded_surgery(nb_b, ml_set)
             elif isinstance(src_force, openmm.CustomNonbondedForce):
-                _oniom_apply_custom_nonbonded_surgery(nb_b, ml_set_with_caps)
+                _oniom_apply_custom_nonbonded_surgery(nb_b, ml_set)
             else:
                 # Should not reach here; caught by the validation loop above.
                 raise NotImplementedError(
@@ -1141,17 +1145,37 @@ def _oniom_apply_nonbonded_surgery(
 ) -> None:
     """Apply the existing electrostatic-mode surgery to a NonbondedForce.
 
-    Mirrors the surgery the existing `embedding="electrostatic"` mode
-    applies to the host NonbondedForce, but here we apply it only to
-    the model `System`'s `nb_b` clone. The `nb_a - nb_b` subtraction
-    inside the model `System`'s `CustomCVForce` then yields exactly
-    the ML-related Coulomb + ML-internal LJ contributions to subtract.
+    Mirrors the surgery ``embedding="electrostatic"`` applies to the host
+    NonbondedForce, but here we apply it to the model ``System``'s
+    ``nb_b`` clone. The ``nb_a - nb_b`` subtraction inside the model
+    ``System``'s ``CustomCVForce`` then yields exactly the ML-related
+    contributions to subtract: ML-ML Coulomb, ML-ML LJ, and ML-MM
+    Coulomb (ML-MM LJ stays in the host and is *not* subtracted).
 
-    Modifications:
-      - ML particle charges → 0 (sigma/epsilon kept).
-      - For every ML-* atom pair: add an exception with chargeProd=0
-        and (for ML-ML) epsilon=0; sigma/epsilon for ML-MM exceptions
-        come from existing source exceptions or LB rules.
+    Modifications (aligned with mlpotential.py:387-401):
+      - ML particle charges → 0 (sigma/epsilon kept). Kills ML-ML
+        Coulomb, ML-MM Coulomb, and reciprocal-space PME contributions
+        involving ML atoms.
+      - ML-ML pairs only: add an exception with chargeProd=0, sigma=1,
+        epsilon=0. Kills ML-ML LJ (Coulomb already gone via the
+        particle-charge zeroing).
+
+    History: an earlier version of this helper also synthesised
+    ``ML-MM`` exceptions (chargeProd=0, sigma/epsilon via combining
+    rules). That was correct against the pre-PR-#15 electrostatic
+    surgery which used pair-by-pair exceptions for every ML-* pair. PR
+    #15 (8992df1, "global-charge-zero variant") switched the additive
+    surgery to only-zero-particle-charges plus ML-ML exceptions, but
+    did not update this helper — leaving ``b``'s ML-MM pairs
+    bookkept via explicit exceptions while ``a``'s ML-MM pairs went
+    through the default pair list. Under PME those two paths are
+    *almost* but not bit-exactly identical (the exception path bypasses
+    reciprocal-space pair handling, and combining-rule rounding can
+    differ from the kernel's per-particle treatment), yielding ~0.1 –
+    1 kJ/mol bookkeeping drift on solvated systems. Tracked-down in
+    MLMM ``test_oniom_electrostatic_parity::test_no_caps_...`` which
+    went from |dE| ~ 1e-12 (May 9 commit) to |dE| ~ 0.38 kJ/mol after
+    PR #15 landed.
     """
     num_particles = force.getNumParticles()
     for i in range(num_particles):
@@ -1159,31 +1183,17 @@ def _oniom_apply_nonbonded_surgery(
             charge, sigma, epsilon = force.getParticleParameters(i)
             force.setParticleParameters(i, 0 * charge, sigma, epsilon)
 
-    # Index existing exceptions (so we don't synthesize over them).
-    existing = {}
+    # Index existing exceptions so we don't synthesize over them.
+    existing = set()
     for i in range(force.getNumExceptions()):
-        p1, p2, chargeProd, sigma, epsilon = force.getExceptionParameters(i)
-        existing[(int(p1), int(p2))] = (chargeProd, sigma, epsilon)
+        p1, p2, *_ = force.getExceptionParameters(i)
+        existing.add(_oniom_ordered_pair(int(p1), int(p2)))
 
-    for i in range(num_particles):
-        i_in_ml = i in ml_set
-        for j in range(i):
-            if not (i_in_ml or j in ml_set):
-                continue
-            key = (i, j)
-            rev = (j, i)
-            if key in existing:
-                _, sigma, epsilon = existing[key]
-            elif rev in existing:
-                _, sigma, epsilon = existing[rev]
-            else:
-                _, sigma1, epsilon1 = force.getParticleParameters(i)
-                _, sigma2, epsilon2 = force.getParticleParameters(j)
-                sigma = 0.5 * (sigma1 + sigma2)
-                epsilon = unit.sqrt(epsilon1 * epsilon2)
-            if i_in_ml and j in ml_set:
-                epsilon = 0 * epsilon
-            force.addException(i, j, 0, sigma, epsilon, True)
+    ml_list = sorted(ml_set)
+    for i_idx, i in enumerate(ml_list):
+        for j in ml_list[:i_idx]:
+            if _oniom_ordered_pair(i, j) not in existing:
+                force.addException(i, j, 0, 1, 0, True)
 
 
 def _oniom_apply_custom_nonbonded_surgery(
