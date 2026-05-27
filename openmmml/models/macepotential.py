@@ -589,15 +589,20 @@ def _prepareLinkRecords(linkRecords, atoms, topology, system):
         raise ValueError("linkRecords requires an explicit `atoms` subset.")
 
     if isinstance(linkRecords, (str, Path)):
-        # Defer import so openmm-ml doesn't require mlmm for the default path.
-        from mlmm.link_atoms import load_link_records
-        recs = load_link_records(linkRecords)
-        # capping_mapping.csv is 1-based; convert to 0-based OpenMM indices.
-        # target_dist comes in via the CSV's `target_dist_ang` column;
-        # linkInfo stores it in Angstroms (canonical — matches MACE-side
-        # `positions_full` in Å). The oniom-electrostatic closure converts
-        # Å→nm at the point of use because its positions are in nm.
-        tuples = [(r.q_idx1 - 1, r.m_idx1 - 1, r.target_dist) for r in recs]
+        # capping_mapping.csv (from cli/oniom/cap_qm_boundary.py) is 1-based:
+        # read (q_idx1, m_idx1, target_dist_ang) and convert to 0-based OpenMM
+        # indices. target_dist stays in Angstroms (canonical — matches the
+        # MACE-side `positions_full` in Å; the oniom-electrostatic closure
+        # converts Å→nm at the point of use). Self-contained so openmm-ml does
+        # not depend on mlmm for the CSV path. Cap positions are not stored in
+        # the CSV; they are recomputed each step from (q, m, target_dist).
+        import csv as _csv
+        tuples = []
+        with open(linkRecords, newline="") as _f:
+            for row in _csv.DictReader(_f):
+                tuples.append(
+                    (int(row["q_idx1"]) - 1, int(row["m_idx1"]) - 1, float(row["target_dist_ang"]))
+                )
     else:
         # Tuple path: target_dist is also in Å (matches the docstring
         # parameter name `target_dist_ang` and the MACE convention used
