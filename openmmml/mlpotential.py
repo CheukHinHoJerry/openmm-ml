@@ -374,28 +374,28 @@ class MLPotential(object):
                             if (a1, a2) not in existing and (a2, a1) not in existing:
                                 force.addExclusion(a1, a2)
         elif embedding == "electrostatic":
-            # Electrostatic embedding via the "global charge zero" variant:
-            # zero the ML atoms' partial charges on the NonbondedForce so all
-            # classical Coulomb terms involving an ML atom (ML-ML, ML-MM, and
-            # reciprocal-space PME contributions under PBC) vanish at the
-            # MM side. The ML potential then re-introduces the ML-side
-            # electrostatics through its own MM-charge input. Sigma and
-            # epsilon are preserved so ML-MM Lennard-Jones survives via the
-            # default nonbonded pair list. ML-ML pairs are explicitly
-            # excluded (chargeProd=0, sigma=1, epsilon=0) so neither
-            # Coulomb nor LJ acts between ML atoms classically.
+            # Electrostatic embedding via the "global charge zero" variant.
+            # The ML potential re-introduces the ML-side electrostatics through
+            # its own MM-charge input; the classical NonbondedForce must
+            # therefore contribute zero Coulomb anywhere an ML atom is
+            # involved. ML-MM Lennard-Jones is kept, subject to the
+            # NonbondedForce's own cutoff.
             for force in newSystem.getForces():
                 if isinstance(force, openmm.NonbondedForce):
-                    # Zero ML atom charges globally.
-                    # This removes:
-                    #   - ML-ML Coulomb
-                    #   - ML-MM Coulomb
-                    #   - reciprocal-space PME terms involving ML atoms
-                    # while preserving LJ parameters.
+                    atomSet = set(atomList)
+                    # Zero ML charges on the direct pair list (and PME).
                     for i in atomList:
                         charge, sigma, epsilon = force.getParticleParameters(i)
                         force.setParticleParameters(i, 0 * charge, sigma, epsilon)
-
+                    # Re-zero the chargeProds that ForceField.createSystem
+                    # cached in the existing 1-2 / 1-3 / 1-4 exceptions —
+                    # setParticleParameters above does not update those, so
+                    # 1-4 ML-MM Coulomb would otherwise still contribute.
+                    for k in range(force.getNumExceptions()):
+                        p1, p2, _, sigma, epsilon = force.getExceptionParameters(k)
+                        if int(p1) in atomSet or int(p2) in atomSet:
+                            force.setExceptionParameters(k, p1, p2, 0, sigma, epsilon)
+                    # Exclude ML-ML classical entirely (Coulomb and LJ).
                     for i in range(len(atomList)):
                         for j in range(i):
                             force.addException(atomList[i], atomList[j], 0, 1, 0, True)
