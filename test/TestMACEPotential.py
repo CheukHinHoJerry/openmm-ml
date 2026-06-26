@@ -419,3 +419,60 @@ def testComputeMACE_periodic_multiple_links_mixed_wrapped():
     np.testing.assert_allclose(caps[0], [1.0, 5.0, 5.0], atol=1e-9)
     # cap b: Q1=(0.4,1,5), M4 image=(-0.4,1,5), bond (-0.8,0,0), C_L=0.6/0.8 -> (-0.2,1,5)
     np.testing.assert_allclose(caps[1], [-0.2, 1.0, 5.0], atol=1e-9)
+
+
+def testComputeMACE_periodic_embedding_with_link_composes():
+    # Electrostatic embedding (MM-charge forces) and a boundary-crossing link cap
+    # in the same periodic call: the cap force must redistribute onto Q/M along
+    # the minimum-image bond AND the MM force must scatter onto the MM atom (which
+    # here is also the cap's M partner) -- the two contributions add on atom 2.
+    box, td = 10.0, 0.6
+    eS = 96.4853 * 10.0
+    # positions: 0=Q(ml), 1=ml, 2=M(mm, wraps vs Q), 3=mm
+    pos = [[0.5, 5, 5], [2.0, 5, 5], [9.5, 5, 5], [5.0, 5, 8]]
+
+    class _EELinkModel:
+        def __init__(self, dtype=torch.float64):
+            self.r_max = torch.tensor(5.0, dtype=dtype)
+            self.dtype = dtype
+
+        def __call__(self, input_dict, compute_force=True):
+            del compute_force
+            dev = input_dict["positions"].device
+            forces = torch.tensor([[1., 0., 0.], [0., 1., 0.], [3., 0., 1.]],
+                                  dtype=self.dtype, device=dev)        # 2 ml + 1 cap
+            out = {"interaction_energy": torch.zeros(1, dtype=self.dtype, device=dev),
+                   "forces": forces}
+            if "mm_positions" in input_dict:
+                out["mm_forces"] = torch.tensor([[0.5, 0., 0.], [0., 0.5, 0.]],
+                                                dtype=self.dtype, device=dev)
+            return out
+
+    linkInfo = {"K": 1, "q_global": np.array([0]), "m_global": np.array([2]),
+                "target_dist": np.array([td])}
+    mmInfo = {"mm_atoms": np.array([2, 3]), "mm_charges": np.array([-0.5, 0.3])}
+    _, forces = _computeMACE(
+        state=_FakePeriodicState(pos, box), model=_EELinkModel(),
+        ptr=torch.tensor([0, 3], dtype=torch.long),
+        node_attrs=torch.ones((3, 1), dtype=torch.float64),
+        batch=torch.zeros(3, dtype=torch.long),
+        pbc=torch.tensor([True, True, True]),
+        returnEnergyType="interaction_energy",
+        charge=torch.zeros(1, dtype=torch.float64),
+        multiplicity=torch.ones(1, dtype=torch.float64),
+        indices=np.array([0, 1], dtype=np.int64),
+        periodic=True, linkInfo=linkInfo, mmInfo=mmInfo,
+    )
+    # analytic expectation (same min-image bond as cap placement)
+    v = np.array([-1.0, 0.0, 0.0]); C_L = td / 1.0; e_b = v
+    f_link = np.array([3.0, 0.0, 1.0]) * eS
+    proj = f_link @ e_b
+    F_Q = (1 - C_L) * f_link + C_L * proj * e_b
+    F_M = C_L * f_link - C_L * proj * e_b
+    exp = np.array([
+        np.array([1.0, 0.0, 0.0]) * eS + F_Q,        # ml force + cap redistribution
+        np.array([0.0, 1.0, 0.0]) * eS,              # ml force
+        F_M + np.array([0.5, 0.0, 0.0]) * eS,        # cap redistribution + MM force
+        np.array([0.0, 0.5, 0.0]) * eS,              # MM force
+    ])
+    np.testing.assert_allclose(forces, exp, rtol=1e-6, atol=1e-6)
