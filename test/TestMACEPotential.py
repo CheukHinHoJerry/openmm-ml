@@ -10,6 +10,8 @@ import torch
 from openmmml import MLPotential
 from openmmml.models.macepotential import (
     _computeMACE,
+    _min_image,
+    _prepareLinkRecords,
     _prepareMMEmbedding,
     _removeMLMMElectrostatics,
     _should_use_mm_embedding,
@@ -215,3 +217,205 @@ class TestMACE:
         interpEnergy2 = interpContext.getState(getEnergy=True).getPotentialEnergy().value_in_unit(unit.kilojoules_per_mole)
         assert np.isclose(mixedEnergy, interpEnergy1, rtol=1e-5)
         assert np.isclose(mmEnergy, interpEnergy2, rtol=1e-5)
+
+
+# ---------------------------------------------------------------------------
+# Periodic link-atom (minimum-image cap placement) -- the openmm-ml fix that
+# lets periodic/PME QM/MM builds with frontier-bond caps run.
+# ---------------------------------------------------------------------------
+
+def test_min_image_orthorhombic():
+    cell = np.diag([10.0, 10.0, 10.0])
+    v = np.array([[9.0, 0.0, 0.0],      # wraps to -1
+                  [-0.5, 6.0, 0.0],     # y wraps to -4
+                  [0.2, 0.3, -0.4]])    # already minimal
+    out = _min_image(v, cell)
+    np.testing.assert_allclose(
+        out, [[-1.0, 0.0, 0.0], [-0.5, -4.0, 0.0], [0.2, 0.3, -0.4]], atol=1e-12
+    )
+
+
+def test_min_image_triclinic():
+    cell = np.array([[10.0, 0.0, 0.0], [2.0, 9.0, 0.0], [1.0, 1.5, 8.0]])
+    rem = np.array([[0.3, -0.2, 0.1]])
+    v = rem + cell[0] + cell[2]         # one full lattice step (a + c) + remainder
+    out = _min_image(v, cell)
+    np.testing.assert_allclose(out, rem, atol=1e-10)
+
+
+def _periodic_topology_system(n=3, box_nm=2.0):
+    top = app.Topology()
+    res = top.addResidue("X", top.addChain())
+    for i in range(n):
+        top.addAtom(f"A{i}", app.element.carbon, res)
+    a = mm.Vec3(box_nm, 0, 0) * unit.nanometer
+    b = mm.Vec3(0, box_nm, 0) * unit.nanometer
+    c = mm.Vec3(0, 0, box_nm) * unit.nanometer
+    top.setPeriodicBoxVectors((a, b, c))
+    system = mm.System()
+    for i in range(n):
+        system.addParticle(12.0)
+    system.setDefaultPeriodicBoxVectors(a, b, c)
+    return top, system
+
+
+def test_prepareLinkRecords_allows_periodic():
+    # Regression for the lifted guard: a periodic system with link records used
+    # to raise "linkRecords is only supported for non-periodic systems".
+    top, system = _periodic_topology_system()
+    info = _prepareLinkRecords([(0, 2, 1.09)], atoms=[0, 1], topology=top, system=system)
+    assert info is not None and info["K"] == 1
+    np.testing.assert_array_equal(info["q_global"], [0])
+    np.testing.assert_array_equal(info["m_global"], [2])
+
+
+class _FakePeriodicState(_FakeState):
+    def __init__(self, positions_angstrom, box_angstrom):
+        super().__init__(positions_angstrom)
+        L = box_angstrom
+        box = np.diag([L, L, L]) if np.isscalar(L) else np.asarray(L, dtype=np.float64)
+        self._box = box * unit.angstrom
+
+    def getPeriodicBoxVectors(self, asNumpy=False):
+        return self._box
+
+
+class _CapCapturingModel:
+    """Records the positions handed to the model so a test can read the cap
+    position (the last row, after the K appended caps)."""
+
+    def __init__(self, dtype=torch.float64):
+        self.r_max = torch.tensor(5.0, dtype=dtype)
+        self.dtype = dtype
+        self.seen_positions = None
+
+    def __call__(self, input_dict, compute_force=True):
+        del compute_force
+        pos = input_dict["positions"]
+        self.seen_positions = pos.detach().cpu().numpy().copy()
+        n = pos.shape[0]
+        return {
+            "interaction_energy": torch.zeros(1, dtype=self.dtype, device=pos.device),
+            "forces": torch.zeros((n, 3), dtype=self.dtype, device=pos.device),
+        }
+
+
+def _run_link(state, model, linkInfo, periodic):
+    n_nodes = len(np.atleast_1d(linkInfo["q_global"])) + 2  # 2 ML atoms + K caps
+    return _computeMACE(
+        state=state, model=model,
+        ptr=torch.tensor([0, n_nodes], dtype=torch.long),
+        node_attrs=torch.ones((n_nodes, 1), dtype=torch.float64),
+        batch=torch.zeros(n_nodes, dtype=torch.long),
+        pbc=torch.tensor([periodic, periodic, periodic], dtype=torch.bool),
+        returnEnergyType="interaction_energy",
+        charge=torch.zeros(1, dtype=torch.float64),
+        multiplicity=torch.ones(1, dtype=torch.float64),
+        indices=np.array([0, 1], dtype=np.int64),
+        periodic=periodic, linkInfo=linkInfo, mmInfo=None,
+    )
+
+
+def testComputeMACE_periodic_cap_uses_min_image():
+    # Q (atom 0) at x=0.5, M (atom 2) at x=9.5 in a 10 A box: the true bond is the
+    # 1 A image across the boundary (not the 9 A direct vector). With min-image,
+    # C_L = 0.6/1, so the cap sits at Q + 0.6*(-1,0,0) = (-0.1, 5, 5).
+    model = _CapCapturingModel()
+    linkInfo = {"K": 1, "q_global": np.array([0]), "m_global": np.array([2]),
+                "target_dist": np.array([0.6])}
+    _run_link(_FakePeriodicState([[0.5, 5.0, 5.0], [2.0, 5.0, 5.0], [9.5, 5.0, 5.0]], 10.0),
+              model, linkInfo, periodic=True)
+    np.testing.assert_allclose(model.seen_positions[-1], [-0.1, 5.0, 5.0], atol=1e-9)
+
+
+def testComputeMACE_nonperiodic_cap_unchanged():
+    # Regression: non-periodic path is untouched -> direct interpolation.
+    # M = atom 2 at (1,0,0), C_L = 0.6 -> cap at (0.6, 0, 0).
+    model = _CapCapturingModel()
+    linkInfo = {"K": 1, "q_global": np.array([0]), "m_global": np.array([2]),
+                "target_dist": np.array([0.6])}
+    _run_link(_FakeState([[0.0, 0.0, 0.0], [2.0, 0.0, 0.0], [1.0, 0.0, 0.0]]),
+              model, linkInfo, periodic=False)
+    np.testing.assert_allclose(model.seen_positions[-1], [0.6, 0.0, 0.0], atol=1e-9)
+
+
+def testComputeMACE_periodic_bond_too_long_raises():
+    # Min-image bond = (5,5,0), |.| = 7.07 A > inscribed-sphere radius 5 A of the
+    # 10 A cube (a genuinely wrapped pair) -> unsupported, must raise.
+    model = _CapCapturingModel()
+    linkInfo = {"K": 1, "q_global": np.array([0]), "m_global": np.array([2]),
+                "target_dist": np.array([0.6])}
+    with pytest.raises(ValueError, match="inscribed-sphere radius"):
+        _run_link(_FakePeriodicState([[0.0, 0.0, 0.0], [2.0, 0.0, 0.0], [5.0, 5.0, 0.0]], 10.0),
+                  model, linkInfo, periodic=True)
+
+
+def test_min_image_triclinic_skew_requires_lattice_shift():
+    # codex counterexample: for a skewed cell the nearest image needs a lattice
+    # shift even though every fractional component is < 0.5, so component rounding
+    # alone is wrong. The 27-image refinement must recover v - a (the a-row).
+    cell = np.array([[10.0, 0.0, 0.0], [4.9, 8.7, 0.0], [0.0, 0.0, 20.0]])
+    v = np.array([[0.49, 0.46, 0.0]]) @ cell          # frac < 0.5 in every component
+    out = _min_image(v, cell)
+    np.testing.assert_allclose(out, v - cell[0], atol=1e-10)
+    assert np.linalg.norm(out) < np.linalg.norm(v)    # genuinely shorter image
+
+
+def testComputeMACE_periodic_force_redistribution_uses_min_image():
+    # A nonzero force on the cap must be redistributed onto Q and M along the
+    # minimum-image bond direction (not the raw 9 A vector).
+    box, td = 10.0, 0.6
+    f_cap = np.array([0.7, -0.3, 0.2])
+
+    class _CapForceModel(_CapCapturingModel):
+        def __call__(self, input_dict, compute_force=True):
+            out = super().__call__(input_dict, compute_force)
+            forces = out["forces"].clone()
+            forces[-1] = torch.tensor(f_cap, dtype=self.dtype, device=forces.device)
+            out["forces"] = forces
+            return out
+
+    model = _CapForceModel()
+    linkInfo = {"K": 1, "q_global": np.array([0]), "m_global": np.array([2]),
+                "target_dist": np.array([td])}
+    _, forces = _run_link(
+        _FakePeriodicState([[0.5, 5.0, 5.0], [2.0, 5.0, 5.0], [9.5, 5.0, 5.0]], box),
+        model, linkInfo, periodic=True)
+    # analytic redistribution with the min-image bond v = (-1,0,0), C_L = 0.6
+    eS = 96.4853 * 10.0
+    v = np.array([-1.0, 0.0, 0.0]); C_L = td / 1.0; e_b = v
+    fc = f_cap * eS
+    proj = fc @ e_b
+    expected_Q = (1 - C_L) * fc + C_L * proj * e_b
+    expected_M = C_L * fc - C_L * proj * e_b
+    np.testing.assert_allclose(forces[0], expected_Q, rtol=1e-6, atol=1e-6)
+    np.testing.assert_allclose(forces[2], expected_M, rtol=1e-6, atol=1e-6)
+
+
+def testComputeMACE_periodic_multiple_links_mixed_wrapped():
+    # Two caps: one ordinary (atom 3 near atom 0) and one boundary-crossing
+    # (atom 4 at x=9.6 vs Q atom 1 at x=0.4). Order and both placements preserved.
+    box = 10.0
+    pos = [[0.4, 5, 5], [0.4, 1, 5], [2.0, 5, 5],   # 0=Q_a, 1=Q_b(ml), 2 filler ml? no
+           [1.4, 5, 5], [9.6, 1, 5]]                 # 3=M_a (direct), 4=M_b (wraps)
+    # ML atoms = [0,1]; caps: (Q=0,M=3) ordinary, (Q=1,M=4) wrapped
+    model = _CapCapturingModel()
+    linkInfo = {"K": 2, "q_global": np.array([0, 1]), "m_global": np.array([3, 4]),
+                "target_dist": np.array([0.6, 0.6])}
+    n_nodes = 2 + 2
+    _computeMACE(
+        state=_FakePeriodicState(pos, box), model=model,
+        ptr=torch.tensor([0, n_nodes], dtype=torch.long),
+        node_attrs=torch.ones((n_nodes, 1), dtype=torch.float64),
+        batch=torch.zeros(n_nodes, dtype=torch.long),
+        pbc=torch.tensor([True, True, True]),
+        returnEnergyType="interaction_energy",
+        charge=torch.zeros(1, dtype=torch.float64),
+        multiplicity=torch.ones(1, dtype=torch.float64),
+        indices=np.array([0, 1], dtype=np.int64),
+        periodic=True, linkInfo=linkInfo, mmInfo=None)
+    caps = model.seen_positions[2:]                   # rows after the 2 ML atoms
+    # cap a: Q0=(0.4,5,5), M3=(1.4,5,5) -> bond (1,0,0), C_L=0.6 -> (1.0,5,5)
+    np.testing.assert_allclose(caps[0], [1.0, 5.0, 5.0], atol=1e-9)
+    # cap b: Q1=(0.4,1,5), M4 image=(-0.4,1,5), bond (-0.8,0,0), C_L=0.6/0.8 -> (-0.2,1,5)
+    np.testing.assert_allclose(caps[1], [-0.2, 1.0, 5.0], atol=1e-9)

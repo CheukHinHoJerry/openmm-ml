@@ -349,11 +349,21 @@ def _removeMLMMElectrostatics(system: openmm.System, mmInfo) -> None:
 
 def _min_image(v, cell):
     """Minimum-image displacement vectors under a (possibly triclinic) cell whose
-    rows are the lattice vectors. ``v`` has shape (K, 3); each displacement is
-    reduced to its nearest periodic image. Exact for link bonds shorter than half
-    the box (the only regime in which cap placement is supported)."""
-    frac = v @ np.linalg.inv(cell)
-    return (frac - np.round(frac)) @ cell
+    rows are the lattice vectors. ``v`` has shape (K, 3).
+
+    Component-wise fractional rounding gives the orthorhombic image; for skewed
+    cells the true nearest image can need an extra lattice shift even when every
+    fractional component is < 0.5, so we refine over the 27 neighbouring lattice
+    translations and keep the shortest per row. This is exact whenever the
+    displacement is shorter than the cell's inscribed-sphere radius -- always the
+    case for real frontier bonds (the only regime cap placement supports)."""
+    v = np.atleast_2d(np.asarray(v, dtype=np.float64))
+    base = (v @ np.linalg.inv(cell) - np.round(v @ np.linalg.inv(cell))) @ cell
+    shifts = np.array([[i, j, k] for i in (-1, 0, 1) for j in (-1, 0, 1)
+                       for k in (-1, 0, 1)], dtype=np.float64) @ cell
+    cand = base[:, None, :] + shifts[None, :, :]            # (K, 27, 3)
+    best = np.argmin(np.linalg.norm(cand, axis=2), axis=1)  # (K,)
+    return cand[np.arange(cand.shape[0]), best]
 
 
 def _computeMACE(state, model, ptr, node_attrs, batch, pbc, returnEnergyType, charge, multiplicity, indices, periodic, linkInfo=None, mmInfo=None):
@@ -385,12 +395,18 @@ def _computeMACE(state, model, ptr, node_attrs, batch, pbc, returnEnergyType, ch
             cell_A = state.getPeriodicBoxVectors(asNumpy=True).value_in_unit(unit.angstrom)
             v = _min_image(v, cell_A)
             r_M = r_Q + v
-            half_box = 0.5 * np.linalg.norm(cell_A, axis=1).min()
-            if np.any(np.linalg.norm(v, axis=1) >= half_box):
+            # inscribed-sphere radius = half the smallest face-to-face spacing;
+            # the minimum image is unique (and cap placement valid) only below it.
+            vol = abs(np.linalg.det(cell_A))
+            faces = (np.linalg.norm(np.cross(cell_A[1], cell_A[2])),
+                     np.linalg.norm(np.cross(cell_A[0], cell_A[2])),
+                     np.linalg.norm(np.cross(cell_A[0], cell_A[1])))
+            inradius = 0.5 * vol / max(faces)
+            if np.any(np.linalg.norm(v, axis=1) >= inradius):
                 raise ValueError(
-                    "Link bond length exceeds half the minimum box length; "
+                    "Link bond length exceeds the cell inscribed-sphere radius; "
                     "minimum-image cap placement is only valid for link bonds "
-                    "shorter than half the box."
+                    "shorter than that (half the smallest face-to-face spacing)."
                 )
         s = np.linalg.norm(v, axis=1)
         if np.any(s == 0.0):
