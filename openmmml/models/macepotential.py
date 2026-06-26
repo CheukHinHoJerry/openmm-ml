@@ -347,6 +347,15 @@ def _removeMLMMElectrostatics(system: openmm.System, mmInfo) -> None:
 
 
 
+def _min_image(v, cell):
+    """Minimum-image displacement vectors under a (possibly triclinic) cell whose
+    rows are the lattice vectors. ``v`` has shape (K, 3); each displacement is
+    reduced to its nearest periodic image. Exact for link bonds shorter than half
+    the box (the only regime in which cap placement is supported)."""
+    frac = v @ np.linalg.inv(cell)
+    return (frac - np.round(frac)) @ cell
+
+
 def _computeMACE(state, model, ptr, node_attrs, batch, pbc, returnEnergyType, charge, multiplicity, indices, periodic, linkInfo=None, mmInfo=None):
     import torch
     from mace.data.neighborhood import get_neighborhood
@@ -368,6 +377,21 @@ def _computeMACE(state, model, ptr, node_attrs, batch, pbc, returnEnergyType, ch
         r_Q = positions_full[linkInfo["q_global"]]
         r_M = positions_full[linkInfo["m_global"]]
         v = r_M - r_Q
+        if periodic:
+            # Minimum-image the Q->M bond so caps are placed correctly even when
+            # Q and M sit across a periodic boundary. Exact while each link bond
+            # is shorter than half the box; a longer (genuinely wrapped) pair is
+            # unsupported, so raise rather than mis-place the cap.
+            cell_A = state.getPeriodicBoxVectors(asNumpy=True).value_in_unit(unit.angstrom)
+            v = _min_image(v, cell_A)
+            r_M = r_Q + v
+            half_box = 0.5 * np.linalg.norm(cell_A, axis=1).min()
+            if np.any(np.linalg.norm(v, axis=1) >= half_box):
+                raise ValueError(
+                    "Link bond length exceeds half the minimum box length; "
+                    "minimum-image cap placement is only valid for link bonds "
+                    "shorter than half the box."
+                )
         s = np.linalg.norm(v, axis=1)
         if np.any(s == 0.0):
             raise ValueError("Link-atom Q and M coincident at this step.")
@@ -441,6 +465,8 @@ def _computeMACE(state, model, ptr, node_attrs, batch, pbc, returnEnergyType, ch
             r_Q = positions_full[linkInfo["q_global"]]
             r_M = positions_full[linkInfo["m_global"]]
             v = r_M - r_Q
+            if periodic:
+                v = _min_image(v, cell)   # cell (Angstrom) defined above; match cap placement
             s = np.linalg.norm(v, axis=1)
             C_L = linkInfo["target_dist"] / s
             if np.any(~np.isfinite(C_L)) or np.any(C_L <= 0.0) or np.any(C_L >= 1.0):
@@ -467,7 +493,6 @@ def _prepareLinkRecords(linkRecords, atoms, topology, system):
     per-step closure. Returns ``None`` if no link records were supplied.
 
     Assertions (failing loudly):
-      * non-periodic system (PBC deferred to a follow-up PR)
       * ``atoms`` is not None
       * every ``q_global`` is in ``atoms``
       * no ``m_global`` is in ``atoms``
@@ -477,13 +502,10 @@ def _prepareLinkRecords(linkRecords, atoms, topology, system):
     if linkRecords is None:
         return None
 
-    # Non-periodic only (locked assumption, see docs/plans/link-atom-inference.md).
-    is_periodic = (topology.getPeriodicBoxVectors() is not None) or system.usesPeriodicBoundaryConditions()
-    if is_periodic:
-        raise ValueError(
-            "linkRecords is only supported for non-periodic systems in this "
-            "implementation; PBC min-image placement is deferred."
-        )
+    # Periodic systems are allowed: cap positions are placed with minimum-image
+    # at runtime (_computeMACE), exact while each link bond is shorter than half
+    # the box -- always true for real frontier bonds. A genuinely wrapped (Q, M)
+    # pair (longer than half the box) raises there.
     if atoms is None:
         raise ValueError("linkRecords requires an explicit `atoms` subset.")
 
