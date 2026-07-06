@@ -480,26 +480,17 @@ def _computeMACE(state, model, ptr, node_attrs, batch, pbc, returnEnergyType, ch
     if linkInfo is not None:
         if indices is None:
             raise ValueError("linkRecords requires an explicit `atoms` subset.")
-        from openmmml.embedding._links import compute_cap_positions
+        from openmmml.embedding._links import compute_cap_positions, minimum_image_M
         r_Q = positions_full[linkInfo["q_global"]]
         r_M = positions_full[linkInfo["m_global"]]
         if periodic:
             # Minimum-image the Q->M bond so caps are placed correctly even if Q
-            # and M sit across a periodic boundary. Exact while each link bond is
-            # shorter than half the (live) box; a longer pair is genuinely
-            # wrapped and unsupported, so raise rather than mis-place the cap.
+            # and M sit across a periodic boundary. The same imaged r_M is reused
+            # for force redistribution below, so the returned force stays the
+            # gradient of the reported energy. Triclinic-correct; raises on a
+            # genuinely wrapped pair (see minimum_image_M).
             cell_A = state.getPeriodicBoxVectors(asNumpy=True).value_in_unit(unit.angstrom)
-            frac = (r_M - r_Q) @ np.linalg.inv(cell_A)
-            v_mi = (frac - np.round(frac)) @ cell_A
-            half = 0.5 * np.linalg.norm(cell_A, axis=1).min()
-            bond = np.linalg.norm(v_mi, axis=-1)
-            if np.any(bond >= half):
-                raise ValueError(
-                    f"link bond length {bond.max():.2f} A exceeds half the minimum "
-                    f"box length {half:.2f} A; minimum-image cap placement is only "
-                    "valid for link bonds shorter than half the box."
-                )
-            r_M = r_Q + v_mi
+            r_M = minimum_image_M(r_Q, r_M, cell_A)
         pos_link, _C_L_unused = compute_cap_positions(
             r_Q, r_M, linkInfo["target_dist"]
         )
@@ -558,6 +549,7 @@ def _computeMACE(state, model, ptr, node_attrs, batch, pbc, returnEnergyType, ch
         else:
             from openmmml.embedding._links import (
                 compute_cap_positions,
+                minimum_image_M,
                 redistribute_cap_force,
             )
             N = len(indices)
@@ -565,9 +557,15 @@ def _computeMACE(state, model, ptr, node_attrs, batch, pbc, returnEnergyType, ch
             f_link = forces[N:]
             f[indices] = f_ml
             # Redistribute each link atom's force onto its (Q, M) partners.
-            # See _prepareLinkRecords for the bookkeeping.
+            # See _prepareLinkRecords for the bookkeeping. Use the SAME imaged
+            # r_M as the cap placement above, or C_L / the bond direction would
+            # not match the cap that produced f_link (breaking conservativeness
+            # for boundary-crossing bonds).
             r_Q = positions_full[linkInfo["q_global"]]
             r_M = positions_full[linkInfo["m_global"]]
+            if periodic:
+                cell_A = state.getPeriodicBoxVectors(asNumpy=True).value_in_unit(unit.angstrom)
+                r_M = minimum_image_M(r_Q, r_M, cell_A)
             _, C_L = compute_cap_positions(r_Q, r_M, linkInfo["target_dist"])
             F_Q_add, F_M_add = redistribute_cap_force(f_link, r_Q, r_M, C_L)
             # q_global and m_global were validated unique at construction, so

@@ -34,6 +34,66 @@ from __future__ import annotations
 import numpy as np
 
 
+def minimum_image_M(
+    r_Q: np.ndarray,
+    r_M: np.ndarray,
+    cell: np.ndarray,
+) -> np.ndarray:
+    """Return each M atom shifted to its minimum image relative to its Q partner.
+
+    When a Q-M boundary bond straddles a periodic boundary the raw M position is
+    in a different image than Q, and both cap *placement* and cap-force
+    *redistribution* must use the same imaged M (otherwise the redistributed
+    force is not the gradient of the energy the cap produced). Both call sites in
+    ``macepotential._computeMACE`` therefore route ``r_M`` through this helper.
+
+    The nearest image is found by refining the fractional-rounding image over the
+    27 neighbouring lattice translations, which is exact for a **triclinic** cell
+    (plain component-wise rounding is only exact for orthorhombic cells). It is
+    valid whenever the imaged bond is shorter than the cell's inscribed-sphere
+    radius (the Wigner-Seitz nearest-image regime) -- always true for real
+    frontier bonds; a longer (genuinely wrapped) pair raises rather than guess.
+
+    Parameters
+    ----------
+    r_Q, r_M : arrays of shape (K, 3)
+        Q (ML-side) and M (MM-side) positions, one row per cap, in the same
+        length unit as ``cell``.
+    cell : array of shape (3, 3)
+        Periodic box vectors as rows (OpenMM convention).
+
+    Returns
+    -------
+    r_M_imaged : array of shape (K, 3)
+        M positions shifted to the image nearest their Q partner.
+    """
+    r_Q = np.atleast_2d(np.asarray(r_Q, dtype=np.float64))
+    r_M = np.atleast_2d(np.asarray(r_M, dtype=np.float64))
+    cell = np.asarray(cell, dtype=np.float64)
+    inv = np.linalg.inv(cell)
+    v = r_M - r_Q
+    base = (v @ inv - np.round(v @ inv)) @ cell                 # orthorhombic image
+    shifts = np.array([[i, j, k] for i in (-1, 0, 1) for j in (-1, 0, 1)
+                       for k in (-1, 0, 1)], dtype=np.float64) @ cell
+    cand = base[:, None, :] + shifts[None, :, :]                # (K, 27, 3)
+    best = np.argmin(np.linalg.norm(cand, axis=2), axis=1)      # triclinic-correct
+    v_mi = cand[np.arange(cand.shape[0]), best]
+    # Wigner-Seitz inscribed-sphere radius = half the smallest interplanar spacing.
+    a, b, c = cell[0], cell[1], cell[2]
+    vol = abs(np.dot(a, np.cross(b, c)))
+    r_ins = 0.5 * vol / max(np.linalg.norm(np.cross(b, c)),
+                            np.linalg.norm(np.cross(c, a)),
+                            np.linalg.norm(np.cross(a, b)))
+    bond = np.linalg.norm(v_mi, axis=-1)
+    if np.any(bond >= r_ins):
+        raise ValueError(
+            f"link bond length {bond.max():.2f} exceeds the cell inscribed-sphere "
+            f"radius {r_ins:.2f}; minimum-image cap placement is only valid for "
+            "link bonds shorter than that radius (a genuinely wrapped Q-M pair)."
+        )
+    return r_Q + v_mi
+
+
 def compute_cap_positions(
     r_Q: np.ndarray,
     r_M: np.ndarray,
