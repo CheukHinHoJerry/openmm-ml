@@ -34,10 +34,18 @@ from __future__ import annotations
 import numpy as np
 
 
+# All 27 neighbouring lattice-cell offsets (coefficients in {-1, 0, 1}^3).
+_OFFSETS_27 = np.array(
+    [[i, j, k] for i in (-1, 0, 1) for j in (-1, 0, 1) for k in (-1, 0, 1)],
+    dtype=np.float64,
+)
+
+
 def minimum_image_M(
     r_Q: np.ndarray,
     r_M: np.ndarray,
     cell: np.ndarray,
+    max_bond: float = 2.5,
 ) -> np.ndarray:
     """Return each M atom shifted to its minimum image relative to its Q partner.
 
@@ -47,20 +55,26 @@ def minimum_image_M(
     force is not the gradient of the energy the cap produced). Both call sites in
     ``macepotential._computeMACE`` therefore route ``r_M`` through this helper.
 
-    The nearest image is found by refining the fractional-rounding image over the
-    27 neighbouring lattice translations, which is exact for a **triclinic** cell
-    (plain component-wise rounding is only exact for orthorhombic cells). It is
-    valid whenever the imaged bond is shorter than the cell's inscribed-sphere
-    radius (the Wigner-Seitz nearest-image regime) -- always true for real
-    frontier bonds; a longer (genuinely wrapped) pair raises rather than guess.
+    The nearest image is found by a 27-cell search: round the fractional
+    displacement to the nearest lattice cell, then pick the shortest candidate
+    over that cell and its 26 neighbours. This is exact for a real (weakly skewed)
+    simulation box; it is *not* a certified closest-vector solver for
+    pathologically skewed triclinic cells, which do not occur for physical MD
+    systems. As a sanity check, the imaged Q-M distance must stay below
+    ``max_bond`` (Angstrom); a longer bond means a genuinely wrapped / broken pair
+    (or a box thinner than the bond) and raises rather than placing a bad cap.
 
     Parameters
     ----------
     r_Q, r_M : arrays of shape (K, 3)
-        Q (ML-side) and M (MM-side) positions, one row per cap, in the same
-        length unit as ``cell``.
+        Q (ML-side) and M (MM-side) positions, one row per cap, in Angstrom
+        (the unit ``cell`` is given in).
     cell : array of shape (3, 3)
-        Periodic box vectors as rows (OpenMM convention).
+        Periodic box vectors as rows (OpenMM convention), in Angstrom.
+    max_bond : float, optional
+        Chemical sanity ceiling on the imaged Q-M bond length (Angstrom). Frontier
+        bonds are ~1.0-1.6 A; the default 2.5 A leaves margin while still catching
+        a wrongly-imaged / wrapped pair.
 
     Returns
     -------
@@ -70,28 +84,29 @@ def minimum_image_M(
     r_Q = np.atleast_2d(np.asarray(r_Q, dtype=np.float64))
     r_M = np.atleast_2d(np.asarray(r_M, dtype=np.float64))
     cell = np.asarray(cell, dtype=np.float64)
-    inv = np.linalg.inv(cell)
-    v = r_M - r_Q
-    base = (v @ inv - np.round(v @ inv)) @ cell                 # orthorhombic image
-    shifts = np.array([[i, j, k] for i in (-1, 0, 1) for j in (-1, 0, 1)
-                       for k in (-1, 0, 1)], dtype=np.float64) @ cell
-    cand = base[:, None, :] + shifts[None, :, :]                # (K, 27, 3)
-    best = np.argmin(np.linalg.norm(cand, axis=2), axis=1)      # triclinic-correct
-    v_mi = cand[np.arange(cand.shape[0]), best]
-    # Wigner-Seitz inscribed-sphere radius = half the smallest interplanar spacing.
-    a, b, c = cell[0], cell[1], cell[2]
-    vol = abs(np.dot(a, np.cross(b, c)))
-    r_ins = 0.5 * vol / max(np.linalg.norm(np.cross(b, c)),
-                            np.linalg.norm(np.cross(c, a)),
-                            np.linalg.norm(np.cross(a, b)))
-    bond = np.linalg.norm(v_mi, axis=-1)
-    if np.any(bond >= r_ins):
+
+    if cell.shape != (3, 3):
+        raise ValueError("cell must have shape (3, 3)")
+    if abs(np.linalg.det(cell)) < 1e-12:
+        raise ValueError("cell is singular or nearly singular")
+    if r_Q.shape != r_M.shape:
+        raise ValueError("r_Q and r_M must have the same shape")
+
+    dr = r_M - r_Q
+    base = np.round(dr @ np.linalg.inv(cell))          # nearest lattice cell (orthorhombic guess)
+    shifts = base[:, None, :] + _OFFSETS_27[None, :, :]  # (K, 27, 3) integer coefficients
+    cand = dr[:, None, :] - shifts @ cell              # (K, 27, 3) candidate displacements
+    best = np.argmin(np.einsum("kij,kij->ki", cand, cand), axis=1)
+    dr_mi = cand[np.arange(cand.shape[0]), best]
+
+    bond = np.linalg.norm(dr_mi, axis=-1)
+    if np.any(bond >= max_bond):
         raise ValueError(
-            f"link bond length {bond.max():.2f} exceeds the cell inscribed-sphere "
-            f"radius {r_ins:.2f}; minimum-image cap placement is only valid for "
-            "link bonds shorter than that radius (a genuinely wrapped Q-M pair)."
+            f"imaged Q-M link bond length {bond.max():.2f} A exceeds max_bond "
+            f"{max_bond:.2f} A; the pair is genuinely wrapped/broken (or the box is "
+            "thinner than the bond). Increase max_bond only if this bond is real."
         )
-    return r_Q + v_mi
+    return r_Q + dr_mi
 
 
 def compute_cap_positions(
