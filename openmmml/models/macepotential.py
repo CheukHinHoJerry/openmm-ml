@@ -483,6 +483,23 @@ def _computeMACE(state, model, ptr, node_attrs, batch, pbc, returnEnergyType, ch
         from openmmml.embedding._links import compute_cap_positions
         r_Q = positions_full[linkInfo["q_global"]]
         r_M = positions_full[linkInfo["m_global"]]
+        if periodic:
+            # Minimum-image the Q->M bond so caps are placed correctly even if Q
+            # and M sit across a periodic boundary. Exact while each link bond is
+            # shorter than half the (live) box; a longer pair is genuinely
+            # wrapped and unsupported, so raise rather than mis-place the cap.
+            cell_A = state.getPeriodicBoxVectors(asNumpy=True).value_in_unit(unit.angstrom)
+            frac = (r_M - r_Q) @ np.linalg.inv(cell_A)
+            v_mi = (frac - np.round(frac)) @ cell_A
+            half = 0.5 * np.linalg.norm(cell_A, axis=1).min()
+            bond = np.linalg.norm(v_mi, axis=-1)
+            if np.any(bond >= half):
+                raise ValueError(
+                    f"link bond length {bond.max():.2f} A exceeds half the minimum "
+                    f"box length {half:.2f} A; minimum-image cap placement is only "
+                    "valid for link bonds shorter than half the box."
+                )
+            r_M = r_Q + v_mi
         pos_link, _C_L_unused = compute_cap_positions(
             r_Q, r_M, linkInfo["target_dist"]
         )
@@ -578,13 +595,10 @@ def _prepareLinkRecords(linkRecords, atoms, topology, system):
     if linkRecords is None:
         return None
 
-    # Non-periodic only (locked assumption, see docs/plans/link-atom-inference.md).
-    is_periodic = (topology.getPeriodicBoxVectors() is not None) or system.usesPeriodicBoundaryConditions()
-    if is_periodic:
-        raise ValueError(
-            "linkRecords is only supported for non-periodic systems in this "
-            "implementation; PBC min-image placement is deferred."
-        )
+    # Periodic systems are allowed: cap positions are placed with minimum-image
+    # at runtime (_computeMACE), which is exact as long as each link bond is
+    # shorter than half the box -- always true for real frontier bonds. A
+    # genuinely wrapped (Q, M) pair (longer than half the box) raises there.
     if atoms is None:
         raise ValueError("linkRecords requires an explicit `atoms` subset.")
 
