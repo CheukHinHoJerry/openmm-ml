@@ -80,7 +80,6 @@ setup(
         ],
         'openmmml.embeddings': [
             'mechanical = openmmml.embeddings.mechanicalembedding:MechanicalEmbeddingFactory',
-            'electrostatic = openmmml.embeddings.electrostaticembedding:ElectrostaticEmbeddingFactory',
         ]
     }
 )

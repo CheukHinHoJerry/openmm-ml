@@ -379,7 +379,8 @@ automatically.
 
 ### Electrostatic Embedding
 
-Selected with the embedding name `electrostatic`.  The MLIP, rather than the MM force field, computes the electrostatic
+This is a potential-specific embedding method provided by the MACE interface, rather than a generic one, so it is only
+available for MACE models.  It is selected with the embedding name `electrostatic`.  The MLIP, rather than the MM force field, computes the electrostatic
 interactions between the ML and MM atoms: it is given the positions and MM force field charges of the MM atoms, and
 returns forces on them alongside the forces on the ML atoms.  The ML subset can therefore polarise in response to its
 surroundings, which mechanical embedding does not allow.  Lennard-Jones interactions between the ML and MM atoms are

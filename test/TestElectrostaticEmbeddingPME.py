@@ -16,13 +16,26 @@ import pytest
 
 from openmmml import MLPotential
 from openmmml.mlpotential import MLPotentialImpl, MLPotentialImplFactory
+from openmmml.models.macepotential import MACEPotentialImpl
 
 
 # ---------------------------------------------------------------------------
 # Register a no-op MLPotentialImpl for tests
 # ---------------------------------------------------------------------------
 
-class _NoopImpl(MLPotentialImpl):
+class _NoopImpl(MACEPotentialImpl):
+    """The real electrostatic embedding with the model evaluation stubbed out.
+
+    Electrostatic embedding is a MACE-specific embedding method, so these tests
+    inherit MACEPotentialImpl.createMixedSystem() to exercise the actual
+    nonbonded surgery under test.  Only addForces() is stubbed, which is what
+    would otherwise require a MACE checkpoint and the PolarMACE stack; the
+    surgery runs before it and is unaffected.
+    """
+
+    def __init__(self):
+        super().__init__("mace", None)
+
     def addForces(self, topology, system, atoms, forceGroup, **args):
         return
 

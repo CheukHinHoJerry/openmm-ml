@@ -31,6 +31,7 @@ USE OR OTHER DEALINGS IN THE SOFTWARE.
 import openmm
 from openmm import unit
 from openmmml.mlpotential import MLPotential, MLPotentialImpl, MLPotentialImplFactory
+from openmmml.embeddings import utilities
 from typing import Iterable, Optional, Sequence, Tuple, Union
 from functools import partial
 from pathlib import Path
@@ -336,7 +337,7 @@ class MACEPotentialImpl(MLPotentialImpl):
             # OpenMM NonbondedForce, so MM-MM Coulomb stays bit-exact with the
             # original FF (standard practice).
             if linkInfo is not None and linkChargeScheme not in (None, "none"):
-                from openmmml.embeddings._links import (
+                from openmmml.models._links import (
                     apply_link_charge_redistribution as _apply_link_q,
                 )
                 mmInfo["mm_charges"] = _apply_link_q(
@@ -378,6 +379,109 @@ class MACEPotentialImpl(MLPotentialImpl):
             _, _, _, longRange = MACEPotentialImpl.KNOWN_MODELS[self.name]
             return longRange
         return None
+
+    def getSupportedEmbeddings(self) -> list[str]:
+        return ["electrostatic"]
+
+    def createMixedSystem(self,
+                          topology: openmm.app.Topology,
+                          system: openmm.System,
+                          atoms: list[int],
+                          forceGroup: int,
+                          interpolate: bool,
+                          embedding: str,
+                          **args) -> openmm.System:
+        """Create a mixed system using electrostatic embedding.
+
+        The model, rather than the conventional force field, is responsible for
+        the electrostatic interactions between the atoms within the ML subset
+        and those outside of it: it is passed the positions and conventional
+        force field charges of the atoms outside the ML subset, and returns
+        forces on them alongside the forces on the ML subset.  The ML subset can
+        therefore polarize in response to its surroundings, which mechanical
+        embedding does not allow.
+
+        This is implemented as the "global charge zero" variant: the
+        conventional force field charge of every atom in the ML subset is set to
+        zero.  Every Coulomb term involving an ML atom is then zero by
+        construction, including the reciprocal space part of PME, without any
+        per-pair exceptions being added.  Adding an exception for each ML-MM
+        pair would instead be incorrect under periodic boundary conditions,
+        since NonbondedForce evaluates exceptions using plain Cartesian
+        distances rather than the minimum image convention, so the ML-MM
+        Lennard-Jones interaction would silently vanish for any pair that is
+        only within the cutoff across a periodic boundary.  Lennard-Jones is
+        left to the conventional force field and continues to use the ordinary,
+        periodicity-aware pair list.
+
+        Interactions within the ML subset are excluded entirely, as the model
+        computes them.  Bonded terms that cross the ML/MM boundary are retained.
+
+        Only models that accept MM charges and positions, which at present means
+        the PolarMACE family, can be used with this embedding method.  An error
+        is raised for any other model rather than falling back to mechanical
+        embedding, since by that point the ML-MM electrostatics have already
+        been removed from the conventional force field and a fallback would
+        simply lose them.
+        """
+
+        if embedding != "electrostatic":
+            raise ValueError(f"Unsupported embedding type: {embedding}")
+
+        if interpolate:
+            # At lambda_interpolate=0 the conventional endpoint would be missing
+            # the ML-MM Coulomb energy, which is removed from the conventional
+            # force field outside of the interpolating CustomCVForce and cannot
+            # be restored from within it.
+            raise ValueError("Electrostatic embedding does not support interpolation.")
+
+        periodic = system.usesPeriodicBoundaryConditions()
+
+        # Create the new system with the ML-ML interactions that the model
+        # computes removed.
+
+        newSystem = utilities.removeBonds(system, atoms, True)
+        atomSet = set(atoms)
+
+        for force in newSystem.getForces():
+            if isinstance(force, openmm.NonbondedForce):
+
+                # Zero the charge of every ML atom, which removes all Coulomb
+                # interactions involving the ML subset while leaving its
+                # Lennard-Jones parameters, and the MM-MM interactions,
+                # untouched.
+
+                for atom in atoms:
+                    charge, sigma, epsilon = force.getParticleParameters(atom)
+                    force.setParticleParameters(atom, 0.0, sigma, epsilon)
+
+                # setParticleParameters() does not update the charge products
+                # that were precomputed for existing exceptions, so the 1-4
+                # Coulomb terms crossing the ML/MM boundary have to be zeroed
+                # separately.
+
+                for index in range(force.getNumExceptions()):
+                    p1, p2, chargeProd, sigma, epsilon = force.getExceptionParameters(index)
+                    if p1 in atomSet or p2 in atomSet:
+                        force.setExceptionParameters(index, p1, p2, 0.0, sigma, epsilon)
+
+                # Exclude the ML-ML interactions entirely.
+
+                for i in range(len(atoms)):
+                    for j in range(i):
+                        force.addException(atoms[i], atoms[j], 0, 1, 0, True)
+
+                force.setExceptionsUsePeriodicBoundaryConditions(periodic)
+
+            elif isinstance(force, openmm.CustomNonbondedForce):
+                utilities.addCustomNonbondedExclusions(force, atoms)
+
+        # Add the ML potential, telling it that it is responsible for the
+        # electrostatic interactions with the atoms outside the ML subset.
+
+        self.addForces(topology, newSystem, atoms, forceGroup, embedding=embedding, **args)
+
+        return newSystem
 
 
 def _supports_mm_embedding(model) -> bool:
@@ -505,7 +609,7 @@ def _computeMACE(state, model, ptr, node_attrs, batch, pbc, returnEnergyType, ch
     if linkInfo is not None:
         if indices is None:
             raise ValueError("linkRecords requires an explicit `atoms` subset.")
-        from openmmml.embeddings._links import compute_cap_positions, minimum_image_M
+        from openmmml.models._links import compute_cap_positions, minimum_image_M
         r_Q = positions_full[linkInfo["q_global"]]
         r_M = positions_full[linkInfo["m_global"]]
         if periodic:
@@ -572,7 +676,7 @@ def _computeMACE(state, model, ptr, node_attrs, batch, pbc, returnEnergyType, ch
         if linkInfo is None:
             f[indices] = forces
         else:
-            from openmmml.embeddings._links import (
+            from openmmml.models._links import (
                 compute_cap_positions,
                 minimum_image_M,
                 redistribute_cap_force,
