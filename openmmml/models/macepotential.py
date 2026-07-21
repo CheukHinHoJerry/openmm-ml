@@ -62,7 +62,9 @@ class MACEPotentialImpl(MLPotentialImpl):
     >>> potential = MLPotential('mace-off23-small')
 
     Other available models include 'mace-off23-medium', 'mace-off23-large', 'mace-off24-medium',
-    'mace-mpa-0-medium', 'mace-omat-0-small', 'mace-omat-0-medium', and 'mace-omol-0-extra-large'.
+    'mace-mpa-0-medium', 'mace-omat-0-small', 'mace-omat-0-medium', 'mace-omol-0-extra-large',
+    and the PolarMACE models 'mace-polar-1-small', 'mace-polar-1-medium' and 'mace-polar-1-large',
+    which are the ones that support electrostatic embedding.
 
     To use a locally trained MACE model, provide the path to the model file. For example:
 
@@ -110,16 +112,23 @@ class MACEPotentialImpl(MLPotentialImpl):
         The path to the locally trained MACE model if ``name`` is 'mace'.
     """
 
-    # (Function name, model name, restrictive license, long-range)
+    # (Function name, model name, restrictive license, long-range, accepts MM charges)
+    #
+    # The last flag records whether the model can be given the charges and
+    # positions of the atoms outside the ML subset, which is what electrostatic
+    # embedding requires.  Only the PolarMACE family can.
     KNOWN_MODELS = {
-        'mace-off23-small': ('mace_off', 'small', True, False),
-        'mace-off23-medium': ('mace_off', 'medium', True, False),
-        'mace-off23-large': ('mace_off', 'large', True, False),
-        'mace-off24-medium': ('mace_off', 'https://github.com/ACEsuit/mace-off/blob/main/mace_off24/MACE-OFF24_medium.model?raw=true', True, False),
-        'mace-mpa-0-medium': ('mace_mp', 'medium-mpa-0', False, False),
-        'mace-omat-0-small': ('mace_mp', 'small-omat-0', True, False),
-        'mace-omat-0-medium': ('mace_mp', 'medium-omat-0', True, False),
-        'mace-omol-0-extra-large': ('mace_omol', 'extra_large', True, False),
+        'mace-off23-small': ('mace_off', 'small', True, False, False),
+        'mace-off23-medium': ('mace_off', 'medium', True, False, False),
+        'mace-off23-large': ('mace_off', 'large', True, False, False),
+        'mace-off24-medium': ('mace_off', 'https://github.com/ACEsuit/mace-off/blob/main/mace_off24/MACE-OFF24_medium.model?raw=true', True, False, False),
+        'mace-mpa-0-medium': ('mace_mp', 'medium-mpa-0', False, False, False),
+        'mace-omat-0-small': ('mace_mp', 'small-omat-0', True, False, False),
+        'mace-omat-0-medium': ('mace_mp', 'medium-omat-0', True, False, False),
+        'mace-omol-0-extra-large': ('mace_omol', 'extra_large', True, False, False),
+        'mace-polar-1-small': ('mace_polar', 'polar-1-s', False, True, True),
+        'mace-polar-1-medium': ('mace_polar', 'polar-1-m', False, True, True),
+        'mace-polar-1-large': ('mace_polar', 'polar-1-l', False, True, True),
     }
 
     def __init__(self, name: str, modelPath) -> None:
@@ -138,6 +147,50 @@ class MACEPotentialImpl(MLPotentialImpl):
         """
         self.name = name
         self.modelPath = modelPath
+        self._preloadedModel = None
+
+    def _loadModel(self, args):
+        """Load the MACE model, returning it along with the device it is on.
+
+        If createMixedSystem() has already loaded a model in order to inspect
+        it, that one is handed over here rather than the checkpoint being read a
+        second time.  The handover is consumed on use, so each call after that
+        loads afresh; holding the model indefinitely would mean a later call
+        with a different precision converting an already converted model.
+        """
+        import torch
+        try:
+            from mace.calculators.foundations_models import mace_off, mace_mp, mace_omol, mace_polar
+        except ImportError as e:
+            raise ImportError(f"Failed to import mace with error: {e}. Install mace with 'pip install mace-torch'.")
+
+        device = self._getTorchDevice(args)
+        preloaded, self._preloadedModel = self._preloadedModel, None
+        if preloaded is not None and preloaded[1] == device:
+            return preloaded[0], device
+
+        if self.name in MACEPotentialImpl.KNOWN_MODELS:
+            functions = {
+                'mace_off': mace_off,
+                'mace_mp': mace_mp,
+                'mace_omol': mace_omol,
+                'mace_polar': mace_polar,
+            }
+            fnName, name, warn, _, _ = MACEPotentialImpl.KNOWN_MODELS[self.name]
+            model = functions[fnName](model=name, device=device, return_raw_model=True).to(device)
+            if warn:
+                import logging
+                logging.warning(f'The model {self.name} is distributed under the restrictive ASL license.  Commercial use is not permitted.')
+        elif self.name == "mace":
+            if self.modelPath is not None:
+                model = torch.load(self.modelPath, map_location=device)
+                if hasattr(model, "to"):
+                    model = model.to(device)
+            else:
+                raise ValueError("No modelPath provided for local MACE model.")
+        else:
+            raise ValueError(f"Unsupported MACE model: {self.name}")
+        return model, device
 
     def addForces(
         self,
@@ -199,18 +252,19 @@ class MACEPotentialImpl(MLPotentialImpl):
             practice). Z2 and RCD (which require per-step virtual charges)
             are not in this iteration.
         embedding : {"mechanical", "electrostatic"}
-            Mixed-system embedding mode for local PolarMACE models. ``mechanical``
-            preserves the previous behavior: MM positions/charges are not passed
-            into MACE. ``electrostatic`` passes MM positions/charges into
-            PolarMACE, removes classical ML-MM Coulomb from the MM
-            ``NonbondedForce``, and scatters returned ``mm_forces`` back onto
-            MM atoms. Non-PolarMACE models ignore this option and behave as
-            mechanical embedding.
+            Which embedding method the caller is implementing. Set by
+            ``createMixedSystem``; there is normally no reason to pass it here
+            directly. ``mechanical`` (the default) does not pass MM positions
+            or charges into MACE. ``electrostatic`` passes them into PolarMACE
+            and scatters the returned ``mm_forces`` back onto the MM atoms; the
+            removal of the classical ML-MM Coulomb that this assumes is done by
+            ``createMixedSystem``, not here. It is an error to request it for a
+            model that cannot accept MM charges.
         """
         import torch
         try:
             from mace.tools import utils, to_one_hot, atomic_numbers_to_indices
-            from mace.calculators.foundations_models import mace_off, mace_mp, mace_omol
+            from mace.calculators.foundations_models import mace_off, mace_mp, mace_omol, mace_polar
         except ImportError as e:
             raise ImportError(f"Failed to import mace with error: {e}. Install mace with 'pip install mace-torch'.")
         try:
@@ -222,27 +276,7 @@ class MACEPotentialImpl(MLPotentialImpl):
 
         # Load the model.
 
-        device = self._getTorchDevice(args)
-        if self.name in MACEPotentialImpl.KNOWN_MODELS:
-            functions = {
-                'mace_off': mace_off,
-                'mace_mp': mace_mp,
-                'mace_omol': mace_omol,
-            }
-            fnName, name, warn, _ = MACEPotentialImpl.KNOWN_MODELS[self.name]
-            model = functions[fnName](model=name, device=device, return_raw_model=True).to(device)
-            if warn:
-                import logging
-                logging.warning(f'The model {self.name} is distributed under the restrictive ASL license.  Commercial use is not permitted.')
-        elif self.name == "mace":
-            if self.modelPath is not None:
-                model = torch.load(self.modelPath, map_location=device)
-                if hasattr(model, "to"):
-                    model = model.to(device)
-            else:
-                raise ValueError("No modelPath provided for local MACE model.")
-        else:
-            raise ValueError(f"Unsupported MACE model: {self.name}")
+        model, device = self._loadModel(args)
 
         use_mm_embedding = _should_use_mm_embedding(model, atoms, embedding)
 
@@ -342,32 +376,29 @@ class MACEPotentialImpl(MLPotentialImpl):
                           periodic=periodic,
                           linkInfo=linkInfo,
                           mmInfo=mmInfo)
-        PythonForce = getattr(openmm, "PythonForce", None)
-        if PythonForce is None:
-            PythonForce = getattr(getattr(openmm, "openmm", None), "PythonForce", None)
-        if PythonForce is None:
-            raise RuntimeError("PythonForce is not available in this OpenMM build.")
-        force = PythonForce(compute)
+        force = openmm.PythonForce(compute)
         force.setForceGroup(forceGroup)
         force.setUsesPeriodicBoundaryConditions(periodic)
         system.addForce(force)
 
     def getMLLongRange(self) -> bool | None:
         if self.name in MACEPotentialImpl.KNOWN_MODELS:
-            _, _, _, longRange = MACEPotentialImpl.KNOWN_MODELS[self.name]
+            _, _, _, longRange, _ = MACEPotentialImpl.KNOWN_MODELS[self.name]
             return longRange
         return None
 
     def getSupportedEmbeddings(self) -> list[str]:
 
-        # Electrostatic embedding requires a model that accepts MM charges and
-        # positions, which none of the pretrained foundation models do.  Only a
-        # custom checkpoint can be one, so only for those is the method offered
-        # here; whether the checkpoint really is one is checked when it is
-        # loaded, since that is the first point at which it can be.
+        # Electrostatic embedding requires a model that accepts the charges and
+        # positions of the atoms outside the ML subset, which of the pretrained
+        # models only the PolarMACE family does.  A custom checkpoint may be a
+        # PolarMACE model too, but that cannot be known without loading it, so
+        # the method is offered and createMixedSystem() rejects the checkpoint
+        # once loaded if it turns out not to be one.
 
         if self.name in MACEPotentialImpl.KNOWN_MODELS:
-            return []
+            _, _, _, _, acceptsMMCharges = MACEPotentialImpl.KNOWN_MODELS[self.name]
+            return ["electrostatic"] if acceptsMMCharges else []
         return ["electrostatic"]
 
     def createMixedSystem(self,
@@ -414,6 +445,20 @@ class MACEPotentialImpl(MLPotentialImpl):
 
         if embedding != "electrostatic":
             raise ValueError(f"Unsupported embedding type: {embedding}")
+
+        # Check that the model can actually accept MM charges and positions
+        # before touching the System, so that an unsuitable model is rejected
+        # with the System left alone rather than stripped of its ML-MM
+        # electrostatics.  This is also the first point at which the check is
+        # possible, since it needs the loaded checkpoint; the model is handed to
+        # addForces() below so the checkpoint is only read once.
+
+        model, device = self._loadModel(args)
+        if not _supports_mm_embedding(model):
+            raise ValueError(
+                f"embedding='{embedding}' requires a model that accepts MM charges "
+                f"and positions (PolarMACE); got {model.__class__.__name__}."
+            )
 
         if interpolate:
             # At lambda_interpolate=0 the conventional endpoint would be missing
@@ -464,9 +509,14 @@ class MACEPotentialImpl(MLPotentialImpl):
                 utilities.addCustomNonbondedExclusions(force, atoms)
 
         # Add the ML potential, telling it that it is responsible for the
-        # electrostatic interactions with the atoms outside the ML subset.
+        # electrostatic interactions with the atoms outside the ML subset, and
+        # handing over the model already loaded above.
 
-        self.addForces(topology, newSystem, atoms, forceGroup, embedding=embedding, **args)
+        self._preloadedModel = (model, device)
+        try:
+            self.addForces(topology, newSystem, atoms, forceGroup, embedding=embedding, **args)
+        finally:
+            self._preloadedModel = None
 
         return newSystem
 

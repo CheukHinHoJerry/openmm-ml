@@ -36,6 +36,16 @@ class _NoopImpl(MACEPotentialImpl):
     def __init__(self):
         super().__init__("mace", None)
 
+    def _loadModel(self, args):
+        # createMixedSystem() loads the model to check that it accepts MM
+        # charges.  Stand in for a real checkpoint with an object of the class
+        # it looks for, so the surgery under test runs without the PolarMACE
+        # stack being installed.
+        class PolarMACE:
+            pass
+
+        return PolarMACE(), "cpu"
+
     def addForces(self, topology, system, atoms, forceGroup, **args):
         return
 

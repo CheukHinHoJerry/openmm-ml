@@ -146,12 +146,14 @@ def testElectrostaticEmbeddingRejectsUnsupportedCases():
         _should_use_mm_embedding(PolarMACE(), None, "electrostatic")
 
 
-def testOnlyCustomModelsOfferElectrostaticEmbedding():
-    """None of the pretrained foundation models accept MM charges, so none of
-    them should advertise electrostatic embedding.  Only a custom checkpoint can
-    be a PolarMACE model, so only those offer it."""
-    for name in MACEPotentialImpl.KNOWN_MODELS:
-        assert MLPotential(name).getSupportedEmbeddings() == ['mechanical'], name
+def testOnlyPolarModelsOfferElectrostaticEmbedding():
+    """Electrostatic embedding needs a model that accepts MM charges, which of
+    the pretrained models only the PolarMACE family does.  A custom checkpoint
+    may be one, so it is offered there too and checked once the model loads."""
+    for name, (_, _, _, _, acceptsMMCharges) in MACEPotentialImpl.KNOWN_MODELS.items():
+        embeddings = MLPotential(name).getSupportedEmbeddings()
+        assert ('electrostatic' in embeddings) == acceptsMMCharges, name
+        assert acceptsMMCharges == name.startswith('mace-polar'), name
     custom = MLPotential('mace', modelPath='unused-until-forces-are-added.model')
     assert 'electrostatic' in custom.getSupportedEmbeddings()
 
