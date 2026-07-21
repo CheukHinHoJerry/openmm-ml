@@ -81,7 +81,25 @@ class TorchMDNetPotentialImpl(MLPotentialImpl):
 
     >>> potential = MLPotential('aceff-1.0')
 
+    Coulomb cutoff behavior
+    ------------------------
+    The Coulomb cutoff in TorchMD-Net uses a reaction-field approximation. Applying it to a
+    non-periodic system introduces errors, so by default the cutoff is only used when the
+    system uses periodic boundary conditions.
+
+    You can override this with the ``useCoulombCutoff`` argument if you know which behavior
+    you want, for example:
+
+    >>>  system = potential.createSystem(pdb.topology, useCoulombCutoff=False)
+
     """
+
+    # (Repository ID, filename, long-range)
+    KNOWN_MODELS = {
+        'aceff-1.0': ('Acellera/AceFF-1.0', 'aceff_v1.0.ckpt', False),
+        'aceff-1.1': ('Acellera/AceFF-1.1', 'aceff_v1.1.ckpt', False),
+        'aceff-2.0': ('Acellera/AceFF-2.0', 'aceff_v2.0.ckpt', False),
+    }
 
     def __init__(self, 
                  name: str,
@@ -144,16 +162,9 @@ class TorchMDNetPotentialImpl(MLPotentialImpl):
                 from huggingface_hub import hf_hub_download
             except ImportError as e:
                 raise ImportError(f"Failed to import huggingface_hub please install from https://huggingface.co/docs/huggingface_hub/en/installation")
-            
-            if self.name == 'aceff-1.0':
-                repo_id="Acellera/AceFF-1.0"
-                filename="aceff_v1.0.ckpt"
-            elif self.name == 'aceff-1.1':
-                repo_id="Acellera/AceFF-1.1"
-                filename="aceff_v1.1.ckpt"
-            elif self.name == 'aceff-2.0':
-                repo_id="Acellera/AceFF-2.0"
-                filename="aceff_v2.0.ckpt"
+
+            if self.name in TorchMDNetPotentialImpl.KNOWN_MODELS:
+                repo_id, filename, _ = TorchMDNetPotentialImpl.KNOWN_MODELS[self.name]
             else:
                 raise ValueError(f'Model name {self.name} does not exist.')
 
@@ -162,12 +173,14 @@ class TorchMDNetPotentialImpl(MLPotentialImpl):
                 filename=filename,
             )
 
+        periodic = (topology.getPeriodicBoxVectors() is not None) or system.usesPeriodicBoundaryConditions()
+        use_coulomb_cutoff = args.get('useCoulombCutoff', periodic)
         model = load_model(
             model_file_path,
             derivative=False,
             remove_ref_energy = args.get('remove_ref_energy', True),
             max_num_neighbors = min(args.get('max_num_neighbors', 64), numbers.shape[0]),
-            coulomb_cutoff = cutoff,
+            coulomb_cutoff = cutoff if use_coulomb_cutoff else None,
             static_shapes = True,
             check_errors = False
         ).to(device)
@@ -182,7 +195,6 @@ class TorchMDNetPotentialImpl(MLPotentialImpl):
             indices = None
         else:
             indices = np.array(atoms)
-        periodic = (topology.getPeriodicBoxVectors() is not None) or system.usesPeriodicBoundaryConditions()
 
         # Create the PythonForce and add it to the System.
 
@@ -199,6 +211,11 @@ class TorchMDNetPotentialImpl(MLPotentialImpl):
         force.setUsesPeriodicBoundaryConditions(periodic)
         system.addForce(force)
 
+    def getMLLongRange(self) -> bool | None:
+        if self.name in TorchMDNetPotentialImpl.KNOWN_MODELS:
+            _, _, longRange = TorchMDNetPotentialImpl.KNOWN_MODELS[self.name]
+            return longRange
+        return None
 
 class _ComputeTorchMDNet(object):
     def __init__(self, model, numbers, charge, batch, lengthScale, energyScale, indices, periodic):
@@ -227,7 +244,6 @@ class _ComputeTorchMDNet(object):
             cell = None
         if self.compiled_model is None:
             # The model can't be compiled until after it has been invoked once.
-
             energy = self.model(z=self.numbers, pos=positions/self.lengthScale, batch=self.batch, q=self.charge, box=cell)[0]*self.energyScale
             self.compiled_model = torch.compile(self.model, backend="inductor", dynamic=False, fullgraph=True, mode="reduce-overhead")
         else:

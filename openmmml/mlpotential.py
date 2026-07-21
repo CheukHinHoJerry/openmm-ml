@@ -29,12 +29,9 @@ OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
 USE OR OTHER DEALINGS IN THE SOFTWARE.
 """
 
-import numpy as np
 import openmm
 import openmm.app
-import openmm.unit as unit
-from copy import deepcopy
-from typing import Dict, Iterable, Optional
+from collections.abc import Iterable
 import os
 import shutil
 import tempfile
@@ -57,7 +54,7 @@ class MLPotentialImplFactory(object):
     name of the potential function, and the value should be the name of the
     MLPotentialImplFactory subclass.
     """
-    
+
     def createImpl(self, name: str, **args) -> "MLPotentialImpl":
         """Create a MLPotentialImpl that will be used to implement a MLPotential.
 
@@ -90,11 +87,11 @@ class MLPotentialImpl(object):
     factory that has been registered for that name and uses it to create a
     MLPotentialImpl of the appropriate subclass.
     """
-    
+
     def addForces(self,
                   topology: openmm.app.Topology,
                   system: openmm.System,
-                  atoms: Optional[Iterable[int]],
+                  atoms: Iterable[int] | None,
                   forceGroup: int,
                   **args):
         """Add Force objects to a System to implement the potential function.
@@ -119,6 +116,82 @@ class MLPotentialImpl(object):
             behavior based on extra arguments.
         """
         raise NotImplementedError('Subclasses must implement addForces()')
+
+    def createMixedSystem(self,
+                          topology: openmm.app.Topology,
+                          system: openmm.System,
+                          atoms: list[int],
+                          forceGroup: int,
+                          interpolate: bool,
+                          embedding: str,
+                          **args) -> openmm.System:
+        """Creates a mixed system using a potential-specific embedding method.
+
+        This is invoked by MLPotential.createMixedSystem().  It will only be
+        called with one of the names returned by getSupportedEmbeddings().  If
+        subclasses support any potential-specific embedding methods, they must
+        also provide implementations of those methods by overriding this method.
+        If not, it does not need to be implemented.
+
+        Each embedding method is responsible for implementing interpolation; if
+        interpolate is True, a global parameter "lambda_interpolate" should be
+        present in the returned system, with the behavior as described by
+        MLPotential.createMixedSystem().
+
+        Parameters
+        ----------
+        topology: Topology
+            the Topology for which to create a System
+        system: System
+            a System that models the Topology with a conventional force field
+        atoms: Iterable[int]
+            the indices of all atoms whose interactions should be computed with
+            this potential
+        forceGroup: int
+            the force group the ML potential's Forces should be placed in
+        interpolate: bool
+            if True, create a System that can smoothly interpolate between the
+            conventional and ML potentials
+        embedding: str
+            the name of the embedding method (will always be one in the list
+            returned by the getSupportedEmbeddings() method)
+        args:
+            any additional arguments for the potential or embedding method
+
+        Returns
+        -------
+        a newly created System object that uses this potential function and the
+        requested embedding method to model the Topology
+        """
+
+        raise NotImplementedError('Subclasses must implement createMixedSystem()')
+
+    def getSupportedEmbeddings(self) -> list[str]:
+        """Retrieves a list of names of supported embedding methods (for the
+        creation of mixed ML/MM systems) specific to this potential.  If one of
+        these names is provided instead of providing the name of a generic
+        embedding plugin, embedding will be performed by the potential itself.
+
+        This is invoked by MLPotential.createMixedSystem().  If a subclass
+        wishes to define one or more potential-specific embedding methods, it
+        should implement this method; otherwise, it does not need to.
+        """
+
+        return []
+
+    def getMLLongRange(self) -> bool | None:
+        """Returns whether ML interactions are local (False), or long-ranged
+        (True) when periodic boundary conditions are present.  This controls
+        which interactions are included by some ML/MM embedding methods.
+        Consult the documentation for each embedding method for more details.
+        None can be returned if the nature of the interactions is not known by
+        the MLPotentialImpl.
+
+        The default implementation of this method, used if a subclass does not
+        override it, always returns None.
+        """
+
+        return None
 
     def _getTorchDevice(self, args):
         """This is a utility routine for use by subclasses that are implemented with PyTorch.  It selects what device
@@ -158,6 +231,7 @@ class MLPotentialImpl(object):
                     os.replace(tempPath, targetPath)
         return targetPath
 
+
 class MLPotential(object):
     """A potential function that can be used in simulations.
 
@@ -184,8 +258,9 @@ class MLPotential(object):
     >>> ml_system = potential.createMixedSystem(topology, mm_system, ml_atoms)
     """
 
-    _implFactories: Dict[str, MLPotentialImplFactory] = {}
-    
+    _implFactories: dict[str, MLPotentialImplFactory] = {}
+    _embeddingFactories: dict[str, "EmbeddingFactory"] = {}
+
     def __init__(self, name: str, **args):
         """Create a MLPotential.
 
@@ -200,7 +275,6 @@ class MLPotential(object):
             be used to customize them.  See the documentation on the specific
             potential functions for more information.
         """
-        self._defaultArgs = dict(args)
         self._impl = MLPotential._implFactories[name].createImpl(name, **args)
 
     def createSystem(self, topology: openmm.app.Topology, removeCMMotion: bool = True, **args) -> openmm.System:
@@ -211,7 +285,7 @@ class MLPotential(object):
         topology: Topology
             the Topology for which to create a System
         removeCMMotion: bool
-            if true, a CMMotionRemover will be added to the System. 
+            if true, a CMMotionRemover will be added to the System.
         args:
             particular potential functions may define additional arguments that can
             be used to customize them.  See the documentation on the specific
@@ -229,9 +303,7 @@ class MLPotential(object):
                 system.addParticle(0)
             else:
                 system.addParticle(atom.element.mass)
-        mergedArgs = dict(self._defaultArgs)
-        mergedArgs.update(args)
-        self._impl.addForces(topology, system, None, 0, **mergedArgs)
+        self._impl.addForces(topology, system, None, 0, **args)
         if removeCMMotion:
             system.addForce(openmm.CMMotionRemover())
         return system
@@ -243,36 +315,28 @@ class MLPotential(object):
                           removeConstraints: bool = True,
                           forceGroup: int = 0,
                           interpolate: bool = False,
+                          embedding: str = 'mechanical',
                           **args) -> openmm.System:
         """Create a System that is partly modeled with this potential and partly
         with a conventional force field.
 
-        To use this method, first create a System that is entirely modeled with the
-        conventional force field.  Pass it to this method, along with the indices of the
-        atoms to model with this potential (the "ML subset").  It returns a new System
-        that is identical to the original one except for the following changes.
+        To use this method, first create a System that is entirely modeled with
+        the conventional force field.  Pass it to this method, along with the
+        indices of the atoms to model with this potential (the "ML subset").
 
-        1. Removing all bonds, angles, and torsions for which *all* atoms are in the
-           ML subset.
-        2. For every NonbondedForce and CustomNonbondedForce, adding exceptions/exclusions
-           to prevent atoms in the ML subset from interacting with each other.
-        3. (Optional) Removing constraints between atoms that are both in the ML subset.
-        4. Adding Forces as necessary to compute the internal energy of the ML subset
-           with this potential.
+        If interpolate is False, the resulting system will compute the
+        interactions between atoms outside of the ML subset with the
+        conventional force field, the interactions between atoms within the ML
+        subset with the ML potential, and the interactions between atoms within
+        and outside of the ML subset according to a selectable embedding method.
 
-        Alternatively, the System can include Forces to compute the energy both with the
-        conventional force field and with this potential, and to smoothly interpolate
-        between them.  In that case, it creates a CustomCVForce containing the following.
-
-        1. The Forces to compute this potential.
-        2. Forces to compute the bonds, angles, and torsions that were removed above.
-        3. For every NonbondedForce, a corresponding CustomBondForce to compute the
-           nonbonded interactions within the ML subset.
-
-        The CustomCVForce defines a global parameter called "lambda_interpolate" that interpolates
-        between the two potentials.  When lambda_interpolate=0, the energy is computed entirely with
-        the conventional force field.  When lambda_interpolate=1, the energy is computed entirely with
-        the ML potential.  You can set its value by calling setParameter() on the Context.
+        If interpolate is True, a global parameter "lambda_interpolate" will be
+        made available permitting linear interpolation between the conventional
+        force field and the mixed ML/MM system.  When lambda_interpolate=0, the
+        energy is computed entirely with the conventional force field.  When
+        lambda_interpolate=1, the energy is computed with the ML potential and
+        the selected embedding method.  You can set its value by calling
+        setParameter() on the Context.
 
         Parameters
         ----------
@@ -289,579 +353,56 @@ class MLPotential(object):
         forceGroup: int
             the force group the ML potential's Forces should be placed in
         interpolate: bool
-            if True, create a System that can smoothly interpolate between the conventional
-            and ML potentials
+            if True, create a System that can smoothly interpolate between the
+            conventional and ML potentials
+        embedding: str
+            the name of the embedding method.  The builtin 'mechanical'
+            embedding method is used by default.  Other generic embedding
+            methods may be available, as well as embedding methods specific to
+            the ML potential selected.  MLPotential.getSupportedEmbeddings()
+            will report all embedding methods accepted by the potential.
         args:
-            particular potential functions may define additional arguments that can
-            be used to customize them.  See the documentation on the specific
-            potential functions for more information.
-
-            For ``embedding="oniom-electrostatic"``, two cap-related
-            kwargs are honored when present:
-
-            * ``linkRecords``: list of ``(q_global, m_global, target_dist_ang)``
-              tuples (or path to a CSV / sequence supported by
-              ``MACEPotentialImpl._prepareLinkRecords``). One entry
-              per ML/MM boundary bond. ``target_dist`` is in Å
-              (matches MACE's internal convention).
-            * ``capMMParams``: optional ``dict`` keyed by ``(q, m)``
-              tuples, values ``(charge_e, sigma_nm, epsilon_kjmol)``.
-              MM force-field parameters for each cap atom in the
-              ONIOM low-model. Missing keys fall back to a generic
-              aliphatic-H default ``(0.0, 0.106, 0.0656)``. The
-              default zero charge follows the standard Z1 convention
-              (Lin & Truhlar 2005); non-zero values emit a warning
-              under PBC because of an O(0.01–0.1 kJ/mol) per-cap
-              Ewald-formulation residual that does not bit-exactly
-              cancel between OpenMM PME (host model) and MACE's
-              k-space (MACE model). See
-              ``docs/codex-plans/electrostatic-oniom-redesign.md``
-              for the full discussion.
+            particular potential functions or embedding methods may define
+            additional arguments that can be used to customize them.  See the
+            documentation on the specific potential functions and embedding
+            methods for more information.
 
         Returns
         -------
         a newly created System object that uses this potential function to model the Topology
         """
-        mergedArgs = dict(self._defaultArgs)
-        mergedArgs.update(args)
-        embedding = mergedArgs.get('embedding')
-        if embedding == 'oniom-electrostatic':
-            # Reject interpolate=True up front so a future implementation
-            # cannot silently fall through into a CustomCVForce path that
-            # doesn't compose with the model-Context PythonForce design.
-            # See docs/codex-plans/electrostatic-oniom-redesign.md.
-            if interpolate:
-                raise ValueError(
-                    "interpolate=True is not supported with "
-                    "embedding='oniom-electrostatic'. The ONIOM low-model "
-                    "correction is added as a separate PythonForce, not "
-                    "inside the interpolation CustomCVForce."
-                )
-            return self._build_oniom_mixed_system(
-                topology=topology,
-                system=system,
-                atoms=atoms,
-                forceGroup=forceGroup,
-                removeConstraints=removeConstraints,
-                mergedArgs=mergedArgs,
-            )
-        electrostatic_embedding = embedding == 'electrostatic'
-        if electrostatic_embedding and interpolate:
-            raise ValueError(
-                "interpolate=True is not currently supported with embedding='electrostatic'. "
-                "Electrostatic embedding removes classical ML-MM Coulomb outside the "
-                "interpolation CustomCVForce, so lambda_interpolate=0 would not reproduce "
-                "the conventional MM endpoint."
-            )
 
-
-        # Add nonbonded exceptions and exclusions.
-        newSystem = self._removeBonds(system, atoms, True, removeConstraints)
         atomList = list(atoms)
-        
-        if embedding == 'mechanical':
-            for force in newSystem.getForces():
-                if isinstance(force, openmm.NonbondedForce):
-                    for i in range(len(atomList)):
-                        for j in range(i):
-                            force.addException(atomList[i], atomList[j], 0, 1, 0, True)
-                elif isinstance(force, openmm.CustomNonbondedForce):
-                    existing = set(tuple(force.getExclusionParticles(i)) for i in range(force.getNumExclusions()))
-                    for i in range(len(atomList)):
-                        a1 = atomList[i]
-                        for j in range(i):
-                            a2 = atomList[j]
-                            if (a1, a2) not in existing and (a2, a1) not in existing:
-                                force.addExclusion(a1, a2)
-        elif embedding == "electrostatic":
-            # Electrostatic embedding via the "global charge zero" variant.
-            # The ML potential re-introduces the ML-side electrostatics through
-            # its own MM-charge input; the classical NonbondedForce must
-            # therefore contribute zero Coulomb anywhere an ML atom is
-            # involved. ML-MM Lennard-Jones is kept, subject to the
-            # NonbondedForce's own cutoff.
-            for force in newSystem.getForces():
-                if isinstance(force, openmm.NonbondedForce):
-                    atomSet = set(atomList)
-                    # Zero ML charges on the direct pair list (and PME).
-                    for i in atomList:
-                        charge, sigma, epsilon = force.getParticleParameters(i)
-                        force.setParticleParameters(i, 0 * charge, sigma, epsilon)
-                    # Re-zero the chargeProds that ForceField.createSystem
-                    # cached in the existing 1-2 / 1-3 / 1-4 exceptions —
-                    # setParticleParameters above does not update those, so
-                    # 1-4 ML-MM Coulomb would otherwise still contribute.
-                    for k in range(force.getNumExceptions()):
-                        p1, p2, _, sigma, epsilon = force.getExceptionParameters(k)
-                        if int(p1) in atomSet or int(p2) in atomSet:
-                            force.setExceptionParameters(k, p1, p2, 0, sigma, epsilon)
-                    # Exclude ML-ML classical entirely (Coulomb and LJ).
-                    for i in range(len(atomList)):
-                        for j in range(i):
-                            force.addException(atomList[i], atomList[j], 0, 1, 0, True)
-                elif isinstance(force, openmm.CustomNonbondedForce):
-                    existing = set(tuple(force.getExclusionParticles(i)) for i in range(force.getNumExclusions()))
-                    for i in range(len(atomList)):
-                        a1 = atomList[i]
-                        for j in range(i):
-                            a2 = atomList[j]
-                            if (a1, a2) not in existing and (a2, a1) not in existing:
-                                force.addExclusion(a1, a2)
+
+        # See if we are given an embedding name that the potential can handle.
+        customEmbeddings = self._impl.getSupportedEmbeddings()
+        if embedding in customEmbeddings:
+            system = self._impl.createMixedSystem(topology, system, atomList, forceGroup, interpolate, embedding, **args)
         else:
-            raise ValueError(f"Unsupported embedding type: {embedding}")
-
-        # Add the ML potential.
-
-        if not interpolate:
-            self._impl.addForces(topology, newSystem, atomList, forceGroup, **mergedArgs)
-        else:
-            # Create a CustomCVForce and put the ML forces inside it.
-
-            cv = openmm.CustomCVForce('')
-            cv.addGlobalParameter('lambda_interpolate', 1)
-            tempSystem = openmm.System()
-            self._impl.addForces(topology, tempSystem, atomList, forceGroup, **mergedArgs)
-            mlVarNames = []
-            for i, force in enumerate(tempSystem.getForces()):
-                name = f'mlForce{i+1}'
-                cv.addCollectiveVariable(name, deepcopy(force))
-                mlVarNames.append(name)
-
-            # Create Forces for all the bonded interactions within the ML subset and add them to the CustomCVForce.
-
-            bondedSystem = self._removeBonds(system, atoms, False, removeConstraints)
-            bondedForces = []
-            for force in bondedSystem.getForces():
-                if hasattr(force, 'addBond') or hasattr(force, 'addAngle') or hasattr(force, 'addTorsion'):
-                    bondedForces.append(force)
-            mmVarNames = []
-            for i, force in enumerate(bondedForces):
-                name = f'mmForce{i+1}'
-                cv.addCollectiveVariable(name, deepcopy(force))
-                mmVarNames.append(name)
-
-            # Create a CustomBondForce that computes all nonbonded interactions within the ML subset.
-
-            for force in system.getForces():
-                if isinstance(force, openmm.NonbondedForce):
-                    internalNonbonded = openmm.CustomBondForce('138.935456*chargeProd/r + 4*epsilon*((sigma/r)^12-(sigma/r)^6)')
-                    internalNonbonded.addPerBondParameter('chargeProd')
-                    internalNonbonded.addPerBondParameter('sigma')
-                    internalNonbonded.addPerBondParameter('epsilon')
-                    numParticles = system.getNumParticles()
-                    atomCharge = [0]*numParticles
-                    atomSigma = [0]*numParticles
-                    atomEpsilon = [0]*numParticles
-                    for i in range(numParticles):
-                        charge, sigma, epsilon = force.getParticleParameters(i)
-                        atomCharge[i] = charge
-                        atomSigma[i] = sigma
-                        atomEpsilon[i] = epsilon
-                    exceptions = {}
-                    for i in range(force.getNumExceptions()):
-                        p1, p2, chargeProd, sigma, epsilon = force.getExceptionParameters(i)
-                        exceptions[(p1, p2)] = (chargeProd, sigma, epsilon)
-                    for p1 in atomList:
-                        for p2 in atomList:
-                            if p1 == p2:
-                                break
-                            if (p1, p2) in exceptions:
-                                chargeProd, sigma, epsilon = exceptions[(p1, p2)]
-                            elif (p2, p1) in exceptions:
-                                chargeProd, sigma, epsilon = exceptions[(p2, p1)]
-                            else:
-                                chargeProd = atomCharge[p1]*atomCharge[p2]
-                                sigma = 0.5*(atomSigma[p1]+atomSigma[p2])
-                                epsilon = unit.sqrt(atomEpsilon[p1]*atomEpsilon[p2])
-                            if chargeProd._value != 0 or epsilon._value != 0:
-                                internalNonbonded.addBond(p1, p2, [chargeProd, sigma, epsilon])
-                    if internalNonbonded.getNumBonds() > 0:
-                        name = f'mmForce{len(mmVarNames)+1}'
-                        cv.addCollectiveVariable(name, internalNonbonded)
-                        mmVarNames.append(name)
-
-            # Configure the CustomCVForce so lambda_interpolate interpolates between the conventional and ML potentials.
-
-            mlSum = '+'.join(mlVarNames) if len(mlVarNames) > 0 else '0'
-            mmSum = '+'.join(mmVarNames) if len(mmVarNames) > 0 else '0'
-            cv.setEnergyFunction(f'lambda_interpolate*({mlSum}) + (1-lambda_interpolate)*({mmSum})')
-            newSystem.addForce(cv)
-        return newSystem
-
-    # ------------------------------------------------------------------
-    # ONIOM-EE: model-Context PythonForce implementation (Slice 2′)
-    # See docs/codex-plans/electrostatic-oniom-redesign.md.
-    # ------------------------------------------------------------------
-
-    def _build_oniom_mixed_system(
-        self,
-        topology: "openmm.app.Topology",
-        system: openmm.System,
-        atoms: Iterable[int],
-        forceGroup: int,
-        removeConstraints: bool,
-        mergedArgs: dict,
-    ) -> openmm.System:
-        """Assemble a System for embedding='oniom-electrostatic'.
-
-        Supports both closed-valence (`linkRecords=None`) and capped
-        ML regions. The host MM System is left untouched. A model
-        `Context` PythonForce, instantiated lazily on first force
-        evaluation, evaluates the MM force field on the (possibly
-        capped) ML subsystem and contributes -E_MM(model) /
-        -F_MM(model) to the host. MACE provides E_high(model) via the
-        existing addForces path.
-
-        Total: E_total = E_MM(real) + E_MACE - E_MM(model).
-        """
-        if atoms is None:
-            raise ValueError(
-                "embedding='oniom-electrostatic' requires an explicit "
-                "ml-atoms list."
-            )
-
-        atomList = [int(i) for i in atoms]
-
-        # Normalize cap support args. linkRecords matches the existing
-        # MACE link-atom contract; capMMParams is keyed by (q, m) and
-        # provides MM force-field parameters for each cap atom.
-        link_records_arg = mergedArgs.get('linkRecords')
-        cap_mm_params_arg = mergedArgs.get('capMMParams')
-        cap_info = self._oniom_normalize_caps(
-            link_records_arg, cap_mm_params_arg, system, atomList,
-            topology, mergedArgs,
-        )
-
-        # Host: deepcopy of source MM, no surgery. Bonded terms stay.
-        # NonbondedForce stays. ML particle charges stay.
-        host = deepcopy(system)
-        if removeConstraints:
-            self._oniom_remove_internal_constraints(host, set(atomList))
-
-        # Add MACE PythonForce (+1) to the host. linkRecords flow
-        # through to MACEPotentialImpl.addForces unchanged.
-        self._impl.addForces(topology, host, atomList, forceGroup, **mergedArgs)
-
-        # Build model System for E_MM(model). With caps, K extra
-        # particles are appended at the end; their MM parameters come
-        # from cap_info.
-        model_system = _build_oniom_model_system(
-            system, atomList, cap_info=cap_info,
-        )
-
-        # Wrap the model-Context evaluator in a PythonForce. Contributes
-        # -E_MM(model) and -F_MM(model). Lazy Context instantiation
-        # inside the closure (Codex review finding #2).
-        PythonForce = getattr(openmm, "PythonForce", None)
-        if PythonForce is None:
-            PythonForce = getattr(getattr(openmm, "openmm", None), "PythonForce", None)
-        if PythonForce is None:
-            raise RuntimeError(
-                "PythonForce is not available in this OpenMM build; "
-                "embedding='oniom-electrostatic' requires it."
-            )
-        closure = _make_oniom_low_model_closure(
-            model_system,
-            num_atoms=system.getNumParticles(),
-            cap_info=cap_info,
-        )
-        correction = PythonForce(closure)
-        correction.setForceGroup(forceGroup)
-        # Tell OpenMM this PythonForce needs box vectors when the model
-        # `System` is periodic, otherwise the state passed to our closure
-        # won't include them.
-        host_is_periodic = (
-            (topology.getPeriodicBoxVectors() is not None)
-            or system.usesPeriodicBoundaryConditions()
-        )
-        correction.setUsesPeriodicBoundaryConditions(host_is_periodic)
-        host.addForce(correction)
-
-        return host
-
-    @staticmethod
-    def _oniom_remove_internal_constraints(
-        new_system: openmm.System, atomSet: set
-    ) -> None:
-        """Remove constraints whose two atoms are both in the ML set."""
-        for idx in reversed(range(new_system.getNumConstraints())):
-            p1, p2, _ = new_system.getConstraintParameters(idx)
-            if int(p1) in atomSet and int(p2) in atomSet:
-                new_system.removeConstraint(idx)
-
-    @staticmethod
-    def _oniom_normalize_caps(
-        link_records_arg,
-        cap_mm_params_arg,
-        system: openmm.System,
-        atomList,
-        topology,
-        mergedArgs: dict,
-    ):
-        """Normalize linkRecords + capMMParams into an internal cap_info dict.
-
-        Returns ``None`` when there are no caps (closed-valence, the
-        Slice 2′ path). Returns a dict with arrays / lists when caps
-        are present.
-
-        cap_info schema:
-
-            {
-              "K":              int,
-              "q_global":       np.ndarray of shape (K,) int64,
-              "m_global":       np.ndarray of shape (K,) int64,
-              "target_dist":    np.ndarray of shape (K,) float64 (nm),
-              "cap_charge":     np.ndarray of shape (K,) float64 (e),
-              "cap_sigma":      np.ndarray of shape (K,) float64 (nm),
-              "cap_epsilon":    np.ndarray of shape (K,) float64 (kJ/mol),
-            }
-
-        capMMParams: optional dict keyed by (q, m) tuples, value is
-        (charge_e, sigma_nm, epsilon_kjmol). Missing entries fall back
-        to a generic aliphatic-H default ``(0.0, 0.106, 0.0656)``.
-
-        Cap charge convention
-        ---------------------
-        The default ``cap_charge_e=0.0`` follows the **Z1 convention**
-        (Lin & Truhlar 2005, J. Phys. Chem. A) used by most QM/MM
-        packages: cap atoms are electrostatically silent on the MM
-        side and contribute only via LJ. This mirrors what MACE will
-        produce when its predicted cap charge is small (the typical
-        case for non-polar boundary cuts).
-
-        Non-zero cap charges are accepted but emit a UserWarning
-        under PBC: the OpenMM PME on the model `System` and MACE's
-        GTO k-space evaluator on the same capped region don't share
-        Ewald parameters bit-exactly, leaving an O(0.01–0.1 kJ/mol)
-        per-cap residual in the ONIOM cancellation. This is the
-        standard QM/MM PBC link-atom artifact, well below MACE's own
-        prediction noise on most workflows.
-
-        FUTURE WORK
-        -----------
-        - **Eliminate the Ewald-formulation residual under PBC.**
-          Two paths in the literature:
-
-          1. **Ewald-aware QM/MM** (Eichinger et al. 1999;
-             Laino-Mohamed-Laio-Parrinello 2005) — share OpenMM's PME
-             α and grid with MACE's k-space evaluator so cap-related
-             Coulomb cancels bit-exactly between
-             ``E_high − E_MM(model)``. Requires deeper integration
-             with MACE.
-          2. **Charge redistribution** (Lin-Truhlar RC/RCD) — keep
-             ``cap_charge=0`` and instead redistribute the M atom's
-             MM charge onto its bonded MM neighbors. Bounded boundary
-             dipole error rather than a PME residual. Implementable
-             in a future helper that mutates the host
-             ``NonbondedForce`` per linkRecord.
-
-          For now (Slice 3′), the conservative ``cap_charge=0``
-          default plus a warning on non-zero is the path of least
-          resistance — matches what most QM/MM packages do.
-
-        - **MACE-side cap charge enforcement.** MACE (PolarMACE)
-          predicts whatever charge density its trained model assigns
-          to a cap H. There is no current mechanism to force MACE's
-          predicted ``q_cap = 0``. If a user wants strict
-          "electrostatically inert cap" on both sides, this would
-          require either:
-
-          * Post-processing MACE's output to mask cap atom
-            multipoles before the Coulomb sum, OR
-          * Training a MACE variant with explicit cap-aware features.
-
-          Either change lives in the MACE codebase, not here. The
-          standard QM/MM convention accepts that the high-level
-          (MACE) view of the cap may differ from the low-level (MM)
-          view; the resulting boundary artifact is the well-known
-          link-atom error of O(1–5 kJ/mol) and is mitigated by
-          cutting at non-polar bonds (Cα-Cβ etc.).
-
-        Validation: see ``docs/codex-plans/electrostatic-oniom-
-        redesign.md`` for the design discussion of cap charges and
-        PBC tradeoffs.
-
-        Currently delegates to `MACEPotentialImpl._prepareLinkRecords`
-        for record validation (uniqueness, q ∈ atoms, m ∉ atoms,
-        non-PBC requirement, etc.) so we share the same enforcement
-        as MACE itself.
-        """
-        if link_records_arg is None:
-            if cap_mm_params_arg is not None:
-                raise ValueError(
-                    "capMMParams was provided but linkRecords is None. "
-                    "Each cap MM-params entry must correspond to a "
-                    "link record."
-                )
-            return None
-
-        # Reuse MACE's validator. Imports done lazily because openmmml
-        # users without MACE installed should still be able to import
-        # mlpotential.
-        from openmmml.models.macepotential import _prepareLinkRecords
-        link_info = _prepareLinkRecords(
-            link_records_arg, atomList, topology, system,
-        )
-        if link_info is None:
-            return None
-
-        K = int(link_info["K"])
-        q_global = link_info["q_global"]
-        m_global = link_info["m_global"]
-        target_dist_ang = link_info["target_dist"]
-        # MACE's _prepareLinkRecords stores target_dist in Angstroms
-        # (because MACE's _computeMACE works in Å). The model-Context
-        # closure here works in nm (OpenMM convention), so convert.
-        target_dist_nm = np.asarray(target_dist_ang, dtype=np.float64) * 0.1
-
-        # Default aliphatic-H force field params for the cap.
-        DEFAULT_CHARGE_E = 0.0
-        DEFAULT_SIGMA_NM = 0.106
-        DEFAULT_EPSILON_KJ = 0.0656
-
-        cap_charge = np.full(K, DEFAULT_CHARGE_E, dtype=np.float64)
-        cap_sigma = np.full(K, DEFAULT_SIGMA_NM, dtype=np.float64)
-        cap_epsilon = np.full(K, DEFAULT_EPSILON_KJ, dtype=np.float64)
-
-        if cap_mm_params_arg is not None:
-            if not isinstance(cap_mm_params_arg, dict):
-                raise TypeError(
-                    "capMMParams must be a dict keyed by (q, m) "
-                    "tuples; got "
-                    f"{type(cap_mm_params_arg).__name__}."
-                )
-            for k in range(K):
-                key = (int(q_global[k]), int(m_global[k]))
-                if key in cap_mm_params_arg:
-                    q_e, sig_nm, eps_kj = cap_mm_params_arg[key]
-                    cap_charge[k] = float(q_e)
-                    cap_sigma[k] = float(sig_nm)
-                    cap_epsilon[k] = float(eps_kj)
-
-        # PBC + non-zero cap charges is supported, but emits a
-        # warning. Both the OpenMM PME side (E_MM(model)) and MACE's
-        # GTO k-space side (E_high(model)) include cap-related Ewald
-        # contributions (self-energy, structure factor, neutralizing
-        # background). The two formulations are physically equivalent
-        # but use different α / grid / basis conventions, so the
-        # cancellation in `E_high − E_MM(model)` for cap-related
-        # Coulomb is not bit-exact.
-        #
-        # Magnitude of the residual: bounded by the difference between
-        # OpenMM PME and MACE GTO k-space when evaluated on the same
-        # cap charges. For typical settings (α ~3-4 nm⁻¹, common PME
-        # grids, reasonable cap charges < 0.2 e), the residual is in
-        # the range O(0.01–0.1 kJ/mol) per cap — comparable to the
-        # standard QM/MM PBC link-atom artifact and well within MACE's
-        # own prediction noise.
-        #
-        # The default cap_charge=0 sidesteps this entirely: caps drop
-        # out of both Ewald sums identically, no residual at all.
-        # FUTURE WORK: an Ewald-aware QM/MM coupling (Eichinger-Tavan
-        # multipole expansion or a shared-α PME implementation between
-        # MACE and OpenMM) would eliminate the residual rigorously.
-        # See docs/codex-plans/electrostatic-oniom-redesign.md for the
-        # design discussion and the path forward.
-        host_is_periodic = (
-            (topology.getPeriodicBoxVectors() is not None)
-            or system.usesPeriodicBoundaryConditions()
-        )
-        if host_is_periodic and np.any(cap_charge != 0.0):
-            import warnings
-            nonzero_caps = np.where(cap_charge != 0.0)[0]
-            warnings.warn(
-                "embedding='oniom-electrostatic' under PBC with non-zero "
-                f"cap_charge ({len(nonzero_caps)} of {K} cap(s) non-zero) "
-                "incurs a small Ewald-formulation mismatch between the "
-                "OpenMM PME used in E_MM(model) and the GTO k-space used "
-                "by MACE in E_high(model). The cap-related Coulomb terms "
-                "physically cancel in the ONIOM total but not bit-exactly: "
-                "expect a residual of O(0.01–0.1 kJ/mol) per cap. This is "
-                "the standard QM/MM PBC link-atom artifact (see "
-                "Lin & Truhlar 2005 on charge-redistribution mitigations). "
-                "If you need cap charges to act as a real H-type force-"
-                "field charge, validate against a non-cap reference. "
-                "Set cap_charge=0 (the default) to eliminate the "
-                "residual entirely. "
-                "Tracked as a future improvement in "
-                "docs/codex-plans/electrostatic-oniom-redesign.md.",
-                UserWarning,
-                stacklevel=3,
-            )
-
-        return {
-            "K": K,
-            "q_global": np.asarray(q_global, dtype=np.int64),
-            "m_global": np.asarray(m_global, dtype=np.int64),
-            "target_dist": target_dist_nm,
-            "cap_charge": cap_charge,
-            "cap_sigma": cap_sigma,
-            "cap_epsilon": cap_epsilon,
-        }
-
-    def _removeBonds(self, system: openmm.System, atoms: Iterable[int], removeInSet: bool, removeConstraints: bool) -> openmm.System:
-        """Copy a System, removing all bonded interactions between atoms in (or not in) a particular set.
-
-        Parameters
-        ----------
-        system: System
-            the System to copy
-        atoms: Iterable[int]
-            a set of atom indices
-        removeInSet: bool
-            if True, any bonded term connecting atoms in the specified set is removed.  If False,
-            any term that does *not* connect atoms in the specified set is removed
-        removeConstraints: bool
-            if True, remove constraints between pairs of atoms in the set
-
-        Returns
-        -------
-        a newly created System object in which the specified bonded interactions have been removed
-        """
-        atomSet = set(atoms)
-
-        # Create an XML representation of the System.
-
-        import xml.etree.ElementTree as ET
-        xml = openmm.XmlSerializer.serialize(system)
-        root = ET.fromstring(xml)
-
-        # This function decides whether a bonded interaction should be removed.
-
-        def shouldRemove(termAtoms):
-            return all(a in atomSet for a in termAtoms) == removeInSet
-
-        # Remove bonds, angles, and torsions.
-
-        for bonds in root.findall('./Forces/Force/Bonds'):
-            for bond in bonds.findall('Bond'):
-                bondAtoms = [int(bond.attrib[p]) for p in ('p1', 'p2')]
-                if shouldRemove(bondAtoms):
-                    bonds.remove(bond)
-        for angles in root.findall('./Forces/Force/Angles'):
-            for angle in angles.findall('Angle'):
-                angleAtoms = [int(angle.attrib[p]) for p in ('p1', 'p2', 'p3')]
-                if shouldRemove(angleAtoms):
-                    angles.remove(angle)
-        for torsions in root.findall('./Forces/Force/Torsions'):
-            for torsion in torsions.findall('Torsion'):
-                torsionLabels =  ('p1', 'p2', 'p3', 'p4') if 'p1' in torsion.attrib else ('a1', 'a2', 'a3', 'a4', 'b1', 'b2', 'b3', 'b4')
-                torsionAtoms = [int(torsion.attrib[p]) for p in torsionLabels]
-                if shouldRemove(torsionAtoms):
-                    torsions.remove(torsion)
-
-        # Optionally remove constraints.
+            # Fall back on an embedding plugin.
+            embeddingInstance = MLPotential._embeddingFactories[embedding].createEmbedding(embedding)
+            system = embeddingInstance.createMixedSystem(self._impl, topology, system, atomList, forceGroup, interpolate, **args)
 
         if removeConstraints:
-            for constraints in root.findall('./Constraints'):
-                for constraint in constraints.findall('Constraint'):
-                    constraintAtoms = [int(constraint.attrib[p]) for p in ('p1', 'p2')]
-                    if shouldRemove(constraintAtoms):
-                        constraints.remove(constraint)
+            # Remove all constraints with both atoms in the ML subset.
+            atomSet = set(atoms)
+            constraintsToRemove = []
+            for constraint in range(system.getNumConstraints()):
+                p1, p2, _ = system.getConstraintParameters(constraint)
+                if p1 in atomSet and p2 in atomSet:
+                    constraintsToRemove.append(constraint)
+            for constraint in reversed(constraintsToRemove):
+                system.removeConstraint(constraint)
 
-        # Create a new System from it.
+        return system
 
-        return openmm.XmlSerializer.deserialize(ET.tostring(root, encoding='unicode'))
+    def getSupportedEmbeddings(self) -> list[str]:
+        """Retrieves a list of the names of all of the supported embedding
+        methods for this potential.  This includes all available generic
+        embedding methods and all of those specific to the potential.
+        """
+
+        return sorted(set(MLPotential._embeddingFactories.keys()) | set(self._impl.getSupportedEmbeddings()))
 
     @staticmethod
     def registerImplFactory(name: str, factory: MLPotentialImplFactory):
@@ -876,465 +417,89 @@ class MLPotential(object):
         """
         MLPotential._implFactories[name] = factory
 
+    @staticmethod
+    def registerEmbeddingFactory(name: str, factory: "EmbeddingFactory"):
+        """Register a new embedding method that can be used with MLPotential.
 
-# ---------------------------------------------------------------------
-# ONIOM-EE helpers (Slice 2′ — closed-valence model-Context PythonForce)
-# ---------------------------------------------------------------------
-
-# NonbondedForce methods that are periodic (host evaluates Coulomb with
-# Ewald split). The opposite-sign-PME trick used in the model System
-# applies uniformly to both periodic and non-periodic methods, so this
-# constant is currently informational.
-_ONIOM_PERIODIC_NB_METHODS = frozenset({
-    openmm.NonbondedForce.CutoffPeriodic,
-    openmm.NonbondedForce.Ewald,
-    openmm.NonbondedForce.PME,
-    openmm.NonbondedForce.LJPME,
-})
+        Parameters
+        ----------
+        name: str
+            the name of the embedding method to register for use
+        factory: MLPotentialImplFactory
+            a factory object that will be used to create Embedding objects
+        """
+        MLPotential._embeddingFactories[name] = factory
 
 
-def _oniom_resolve_unsupported_bonded_like():
-    """Bonded-like Force classes the builder does not handle. We refuse
-    to silently drop their ML-internal entries because the host MM
-    `System` still evaluates them, and a missing low-model subtraction
-    would break the ONIOM cancellation."""
-    names = (
-        "CMAPTorsionForce",
-        "RBTorsionForce",
-        "CustomBondForce",
-        "CustomAngleForce",
-        "CustomTorsionForce",
-        "CustomCompoundBondForce",
-        "CustomCentroidBondForce",
-        "AmoebaTorsionTorsionForce",
-        "GayBerneForce",
-    )
-    return tuple(
-        cls for cls in (getattr(openmm, n, None) for n in names) if cls is not None
-    )
+class EmbeddingFactory:
+    """Abstract interface for classes that create Embedding objects.
 
-
-_ONIOM_UNSUPPORTED_BONDED_LIKE = _oniom_resolve_unsupported_bonded_like()
-
-
-def _oniom_resolve_unsupported_nonbonded_like():
-    """Nonbonded-like Force classes the builder does not handle. The
-    builder supports `NonbondedForce` and `CustomNonbondedForce`; any
-    other nonbonded-like force present in the source is refused
-    because its ML-related contribution would not be subtracted by
-    the low-model and the ONIOM cancellation would silently break."""
-    names = (
-        "CustomGBForce",
-        "GBSAOBCForce",
-        "AmoebaMultipoleForce",
-        "AmoebaVdwForce",
-        "AmoebaWcaDispersionForce",
-        "AmoebaGeneralizedKirkwoodForce",
-        "DrudeForce",
-        "HippoNonbondedForce",
-        "ATMForce",
-    )
-    return tuple(
-        cls for cls in (getattr(openmm, n, None) for n in names) if cls is not None
-    )
-
-
-_ONIOM_UNSUPPORTED_NONBONDED_LIKE = _oniom_resolve_unsupported_nonbonded_like()
-
-
-def _build_oniom_model_system(
-    source: openmm.System,
-    ml_atoms: Iterable[int],
-    cap_info: Optional[dict] = None,
-) -> openmm.System:
-    """Build a `System` representing E_MM(model) for ONIOM-EE.
-
-    Construction:
-      1. Clone the source `System` via `XmlSerializer` (preserves PME
-         parameters, box vectors, masses, particles bit-exactly — pinned
-         by Slice 0's `TestOniomSlice0Prereq.py`).
-      2. Strip every Force from the clone. If ``cap_info`` is provided,
-         also append ``K`` cap particles at the end of the clone (mass
-         = 1.008 amu, indices N..N+K-1 in the model `System`).
-      3. Re-add bonded forces (HarmonicBond / HarmonicAngle /
-         PeriodicTorsion) with entries restricted to ML-internal atom
-         tuples. Each copy inherits `usesPeriodicBoundaryConditions()`
-         from the source. (Cap-related bonded entries are NOT
-         synthesized from the MM force field — the user's source
-         topology has no Q-cap parameters, so the bonded picture of
-         the cap is left to MACE on the high side.)
-      4. Re-add **every** ``NonbondedForce`` and ``CustomNonbondedForce``
-         from the source as an opposite-sign pair wrapped in a single
-         ``CustomCVForce`` whose energy is the sum of ``(a_i - b_i)``
-         over all clones. ``b_i`` clones get the ML-side surgery that
-         removes the ML-related contribution. With caps present, both
-         ``a_i`` and ``b_i`` clones have K extra particles appended
-         using ``cap_info``'s MM parameters; the surgery on ``b_i``
-         also zeros cap charges so cap-* Coulomb survives in
-         ``a_i - b_i`` (matching the ML-* surgery semantics).
-
-    Raises
-    ------
-    NotImplementedError
-        If the source contains any bonded-like force class the builder
-        does not support (CMAPTorsion, RBTorsion, custom bond/angle/
-        torsion forces, etc.) OR any nonbonded-like force class
-        beyond ``NonbondedForce`` / ``CustomNonbondedForce``
-        (e.g. ``CustomGBForce``, ``AmoebaMultipoleForce``,
-        ``DrudeForce``).
+    If you are defining a new embedding method, you need to create subclasses of
+    Embedding and EmbeddingFactory, and register an instance of the factory by
+    calling MLPotential.registerEmbeddingFactory().  Alternatively, if a Python
+    package creates an entry point in the group "openmmml.embeddings", the
+    embedding will be registered automatically.  The entry point name is the
+    name of the embedding method, and the value should be the name of the
+    EmbeddingFactory subclass.
     """
-    ml_set = set(int(i) for i in ml_atoms)
-    K = 0 if cap_info is None else int(cap_info["K"])
 
-    # 1. Full XML clone preserves PME params, box, particles, masses.
-    clone_xml = openmm.XmlSerializer.serialize(source)
-    model = openmm.XmlSerializer.deserialize(clone_xml)
+    def createEmbedding(self, name: str) -> "Embedding":
+        """Create an Embedding that will be used to implement an embedding
+        method.
 
-    # Collect every supported nonbonded-like source force in order.
-    source_nb_forces = [
-        f for f in source.getForces()
-        if isinstance(f, (openmm.NonbondedForce, openmm.CustomNonbondedForce))
-    ]
+        When a mixed ML/MM system is created with an MLPotential, it invokes
+        this method to create an object implementing the requested embedding.
+        Subclasses must implement this method to return an instance of the
+        correct Embedding subclass.
 
-    # Validate unsupported bonded-like AND nonbonded-like classes BEFORE
-    # stripping so the error message reflects what the user actually has.
-    for src_force in source.getForces():
-        if isinstance(src_force, _ONIOM_UNSUPPORTED_BONDED_LIKE):
-            raise NotImplementedError(
-                f"embedding='oniom-electrostatic' does not support "
-                f"{type(src_force).__name__} in the source System. "
-                "Strip it before constructing the mixed system, or "
-                "extend the builder."
-            )
-        if isinstance(src_force, _ONIOM_UNSUPPORTED_NONBONDED_LIKE):
-            raise NotImplementedError(
-                f"embedding='oniom-electrostatic' does not support "
-                f"{type(src_force).__name__} in the source System. "
-                "The ONIOM low-model would silently miss its "
-                "ML-related contribution, breaking the cancellation. "
-                "Strip it before constructing the mixed system, or "
-                "extend the builder."
-            )
+        Parameters
+        ----------
+        name: str
+            the name of the embedding given to MLPotential.createMixedSystem()
 
-    # 2. Strip all forces from the clone.
-    while model.getNumForces() > 0:
-        model.removeForce(0)
+        Returns
+        -------
+        an Embedding instance that implements the embedding
+        """
 
-    # 3. Re-add bonded forces restricted to ML.
-    for src_force in source.getForces():
-        if isinstance(src_force, openmm.HarmonicBondForce):
-            new = openmm.HarmonicBondForce()
-            new.setUsesPeriodicBoundaryConditions(
-                src_force.usesPeriodicBoundaryConditions()
-            )
-            for i in range(src_force.getNumBonds()):
-                p1, p2, length, k = src_force.getBondParameters(i)
-                if int(p1) in ml_set and int(p2) in ml_set:
-                    new.addBond(int(p1), int(p2), length, k)
-            if new.getNumBonds() > 0:
-                model.addForce(new)
-        elif isinstance(src_force, openmm.HarmonicAngleForce):
-            new = openmm.HarmonicAngleForce()
-            new.setUsesPeriodicBoundaryConditions(
-                src_force.usesPeriodicBoundaryConditions()
-            )
-            for i in range(src_force.getNumAngles()):
-                p1, p2, p3, theta, k = src_force.getAngleParameters(i)
-                if all(int(p) in ml_set for p in (p1, p2, p3)):
-                    new.addAngle(int(p1), int(p2), int(p3), theta, k)
-            if new.getNumAngles() > 0:
-                model.addForce(new)
-        elif isinstance(src_force, openmm.PeriodicTorsionForce):
-            new = openmm.PeriodicTorsionForce()
-            new.setUsesPeriodicBoundaryConditions(
-                src_force.usesPeriodicBoundaryConditions()
-            )
-            for i in range(src_force.getNumTorsions()):
-                p1, p2, p3, p4, periodicity, phase, k = src_force.getTorsionParameters(i)
-                if all(int(p) in ml_set for p in (p1, p2, p3, p4)):
-                    new.addTorsion(
-                        int(p1), int(p2), int(p3), int(p4), periodicity, phase, k
-                    )
-            if new.getNumTorsions() > 0:
-                model.addForce(new)
-        # Other force types (NonbondedForce, CMMotionRemover, etc.)
-        # are intentionally not copied — the ONIOM low-model only
-        # accounts for ML-internal bonded + ML-* nonbonded.
-
-    # 3b. Append cap particles, if any. Cap atoms get hydrogen mass
-    # and are added to the model `System` *before* nonbonded clones
-    # are built so the clones see N+K particles.
-    if K > 0:
-        cap_atom_indices = []
-        for _ in range(K):
-            cap_atom_indices.append(model.addParticle(1.008))
-        # Cap atom indices are appended at the end: N..N+K-1.
-        cap_info_local = dict(cap_info)
-        cap_info_local["model_indices"] = np.asarray(cap_atom_indices, dtype=np.int64)
-    else:
-        cap_info_local = None
-
-    # 4. Re-add every supported nonbonded-like source force as an
-    # opposite-sign pair inside a single CustomCVForce. The energy is
-    # the sum of (a_i - b_i) over all clones; each pair contributes
-    # exactly the ML-related portion of that source force.
-    if source_nb_forces:
-        cv = openmm.CustomCVForce("")
-        terms = []
-        for idx, src_force in enumerate(source_nb_forces):
-            nb_xml = openmm.XmlSerializer.serialize(src_force)
-            nb_a = openmm.XmlSerializer.deserialize(nb_xml)
-            nb_b = openmm.XmlSerializer.deserialize(nb_xml)
-            # Append K cap particles to BOTH clones so they have the
-            # same particle count as the model `System`. Cap atoms get
-            # explicit MM force-field params from cap_info.
-            if K > 0:
-                if isinstance(src_force, openmm.NonbondedForce):
-                    for k in range(K):
-                        nb_a.addParticle(
-                            float(cap_info_local["cap_charge"][k]) * unit.elementary_charge,
-                            float(cap_info_local["cap_sigma"][k]) * unit.nanometer,
-                            float(cap_info_local["cap_epsilon"][k]) * unit.kilojoule_per_mole,
-                        )
-                        nb_b.addParticle(
-                            float(cap_info_local["cap_charge"][k]) * unit.elementary_charge,
-                            float(cap_info_local["cap_sigma"][k]) * unit.nanometer,
-                            float(cap_info_local["cap_epsilon"][k]) * unit.kilojoule_per_mole,
-                        )
-                elif isinstance(src_force, openmm.CustomNonbondedForce):
-                    # CustomNonbondedForce doesn't have a uniform charge
-                    # parameter list; cap atoms get default
-                    # per-particle parameters (zeros). Custom force
-                    # fields with non-trivial cap params would need a
-                    # follow-up.
-                    nb_a_per_particle = nb_a.getNumPerParticleParameters()
-                    nb_b_per_particle = nb_b.getNumPerParticleParameters()
-                    for _ in range(K):
-                        nb_a.addParticle([0.0] * nb_a_per_particle)
-                        nb_b.addParticle([0.0] * nb_b_per_particle)
-            if isinstance(src_force, openmm.NonbondedForce):
-                # Surgery on the real ML set only. Cap atoms (indices
-                # N..N+K-1) are appended with identical parameters to
-                # nb_a and nb_b and are NOT touched by the surgery —
-                # so every cap-involved Coulomb / LJ term cancels in
-                # (a - b). This matches the additive electrostatic
-                # mode, which never inserts cap atoms into the host
-                # NonbondedForce in the first place (MACE handles all
-                # cap chemistry on the high side).
-                _oniom_apply_nonbonded_surgery(nb_b, ml_set)
-            elif isinstance(src_force, openmm.CustomNonbondedForce):
-                _oniom_apply_custom_nonbonded_surgery(nb_b, ml_set)
-            else:
-                # Should not reach here; caught by the validation loop above.
-                raise NotImplementedError(
-                    f"unexpected nonbonded force class {type(src_force).__name__}"
-                )
-            a_name = f"nb_a_{idx}"
-            b_name = f"nb_b_{idx}"
-            cv.addCollectiveVariable(a_name, nb_a)
-            cv.addCollectiveVariable(b_name, nb_b)
-            terms.append(f"({a_name} - {b_name})")
-        cv.setEnergyFunction(" + ".join(terms))
-        model.addForce(cv)
-
-    return model
+        raise NotImplementedError('Subclasses must implement createEmbedding()')
 
 
-def _oniom_apply_nonbonded_surgery(
-    force: openmm.NonbondedForce, ml_set: set
-) -> None:
-    """Apply the existing electrostatic-mode surgery to a NonbondedForce.
+class Embedding:
+    """Abstract interface for classes that implement embedding methods.
 
-    Mirrors the surgery ``embedding="electrostatic"`` applies to the host
-    NonbondedForce, but here we apply it to the model ``System``'s
-    ``nb_b`` clone. The ``nb_a - nb_b`` subtraction inside the model
-    ``System``'s ``CustomCVForce`` then yields exactly the ML-related
-    contributions to subtract: ML-ML Coulomb, ML-ML LJ, and ML-MM
-    Coulomb (ML-MM LJ stays in the host and is *not* subtracted).
-
-    Modifications (aligned with mlpotential.py:387-401):
-      - ML particle charges → 0 (sigma/epsilon kept). Kills ML-ML
-        Coulomb, ML-MM Coulomb, and reciprocal-space PME contributions
-        involving ML atoms.
-      - ML-ML pairs only: add an exception with chargeProd=0, sigma=1,
-        epsilon=0. Kills ML-ML LJ (Coulomb already gone via the
-        particle-charge zeroing).
-
-    History: an earlier version of this helper also synthesised
-    ``ML-MM`` exceptions (chargeProd=0, sigma/epsilon via combining
-    rules). That was correct against the pre-PR-#15 electrostatic
-    surgery which used pair-by-pair exceptions for every ML-* pair. PR
-    #15 (8992df1, "global-charge-zero variant") switched the additive
-    surgery to only-zero-particle-charges plus ML-ML exceptions, but
-    did not update this helper — leaving ``b``'s ML-MM pairs
-    bookkept via explicit exceptions while ``a``'s ML-MM pairs went
-    through the default pair list. Under PME those two paths are
-    *almost* but not bit-exactly identical (the exception path bypasses
-    reciprocal-space pair handling, and combining-rule rounding can
-    differ from the kernel's per-particle treatment), yielding ~0.1 –
-    1 kJ/mol bookkeeping drift on solvated systems. Tracked-down in
-    MLMM ``test_oniom_electrostatic_parity::test_no_caps_...`` which
-    went from |dE| ~ 1e-12 (May 9 commit) to |dE| ~ 0.38 kJ/mol after
-    PR #15 landed.
+    If you are defining a new embedding method, you need to create subclasses of
+    of Embedding and EmbeddingFactory.  When a user specifies a name for an
+    embedding method that is not a custom embedding method supported by that
+    potential, MLPotential looks up the factory that has been registered for
+    that name and uses it to create an Embedding of the appropriate subclass.
     """
-    num_particles = force.getNumParticles()
-    for i in range(num_particles):
-        if i in ml_set:
-            charge, sigma, epsilon = force.getParticleParameters(i)
-            force.setParticleParameters(i, 0 * charge, sigma, epsilon)
 
-    # Index existing exceptions so we don't synthesize over them.
-    existing = set()
-    for i in range(force.getNumExceptions()):
-        p1, p2, *_ = force.getExceptionParameters(i)
-        existing.add(_oniom_ordered_pair(int(p1), int(p2)))
+    def createMixedSystem(self,
+                          potential: MLPotentialImpl,
+                          topology: openmm.app.Topology,
+                          system: openmm.System,
+                          atoms: list[int],
+                          forceGroup: int,
+                          interpolate: bool,
+                          **args):
+        """Creates a mixed system using the embedding method.
 
-    ml_list = sorted(ml_set)
-    for i_idx, i in enumerate(ml_list):
-        for j in ml_list[:i_idx]:
-            if _oniom_ordered_pair(i, j) not in existing:
-                force.addException(i, j, 0, 1, 0, True)
+        This is invoked by MLPotential.createMixedSystem().  It must be
+        implemented in subclasses.  The implementation should call
+        potential.addForces() as needed to generate the appropriate ML forces.
 
+        Each embedding method is responsible for implementing interpolation; if
+        interpolate is True, a global parameter "lambda_interpolate" should be
+        present in the returned system, with the behavior as described by
+        MLPotential.createMixedSystem().
+        """
 
-def _oniom_apply_custom_nonbonded_surgery(
-    force: openmm.CustomNonbondedForce, ml_set: set
-) -> None:
-    """Apply the existing electrostatic-mode surgery to a CustomNonbondedForce.
+        raise NotImplementedError('Subclasses must implement createMixedSystem()')
 
-    Mirrors what the existing ``embedding="electrostatic"`` mode does
-    to the host (mlpotential.py L370-378): add an exclusion for every
-    ML-ML pair so the ML-internal contribution evaluates to zero in
-    the ``nb_b`` clone. ML-MM pairs are left as-is (they stay in the
-    host and are *not* subtracted by the low-model — analogous to the
-    treatment of ML-MM LJ in ``NonbondedForce``).
-
-    The ``nb_a - nb_b`` subtraction therefore yields exactly the
-    ML-internal CustomNonbondedForce energy.
-    """
-    existing = set()
-    for i in range(force.getNumExclusions()):
-        p1, p2 = force.getExclusionParticles(i)
-        existing.add(_oniom_ordered_pair(int(p1), int(p2)))
-
-    ml_list = sorted(ml_set)
-    for i_idx, i in enumerate(ml_list):
-        for j in ml_list[:i_idx]:
-            key = _oniom_ordered_pair(i, j)
-            if key not in existing:
-                force.addExclusion(i, j)
-
-
-def _oniom_ordered_pair(i: int, j: int):
-    return (i, j) if i < j else (j, i)
-
-
-def _make_oniom_low_model_closure(
-    model_system: openmm.System,
-    num_atoms: int,
-    cap_info: Optional[dict] = None,
-):
-    """Return a callable suitable for `openmm.PythonForce`.
-
-    Closure-bound state holds a lazily-instantiated model `Context`.
-    First call builds the `Context` on the Reference platform; later
-    calls reuse the cached `Context`.
-
-    Returns negated energy/forces so `addForce(PythonForce(closure))`
-    contributes `-E_MM(model)` and `-F_MM(model)` to the host.
-
-    With caps (``cap_info != None``), per-step:
-      1. Read host positions (``num_atoms`` rows).
-      2. Compute K cap positions via the shared
-         ``compute_cap_positions`` helper (same formula MACE uses on
-         its side, so the same chemical region is consistent).
-      3. Set positions on the model `Context` for ``num_atoms + K``
-         particles.
-      4. After ``getState``, redistribute cap forces back onto Q,M
-         using ``redistribute_cap_force`` (the same Jacobian MACE's
-         ``_computeMACE`` uses).
-      5. Return ``num_atoms`` rows of forces (no cap rows in host).
-
-    Notes
-    -----
-    The model `Context` defaults to OpenMM's Reference platform. For
-    Slice 2′ / Slice 3′ this is a correctness-only choice; performance
-    work (matching the host platform) is deferred.
-    """
-    import numpy as np
-
-    state = {"model_context": None}
-    K = 0 if cap_info is None else int(cap_info["K"])
-
-    def closure(host_state):
-        if state["model_context"] is None:
-            platform = openmm.Platform.getPlatformByName("Reference")
-            integrator = openmm.VerletIntegrator(0.001)
-            state["model_context"] = openmm.Context(
-                model_system, integrator, platform
-            )
-
-        ctx = state["model_context"]
-
-        if model_system.usesPeriodicBoundaryConditions():
-            box = host_state.getPeriodicBoxVectors(asNumpy=True)
-            ctx.setPeriodicBoxVectors(box[0], box[1], box[2])
-
-        host_positions = host_state.getPositions(asNumpy=True)
-        if K == 0:
-            ctx.setPositions(host_positions)
-        else:
-            # Compute cap positions from current Q,M using the shared
-            # helper (matches MACE's _computeMACE side).
-            from openmmml.embedding._links import (
-                compute_cap_positions,
-                redistribute_cap_force,
-            )
-            host_pos_nm = host_positions.value_in_unit(unit.nanometer) \
-                if hasattr(host_positions, "value_in_unit") \
-                else np.asarray(host_positions)
-            r_Q = host_pos_nm[cap_info["q_global"]]
-            r_M = host_pos_nm[cap_info["m_global"]]
-            # `cap_info["target_dist"]` is stored in nm by
-            # `_oniom_normalize_caps` (which converts Å→nm out of
-            # linkInfo); `r_Q`, `r_M` are in nm. No conversion needed.
-            cap_pos, cap_C_L = compute_cap_positions(
-                r_Q, r_M, cap_info["target_dist"]
-            )
-            full_pos = np.concatenate(
-                [np.asarray(host_pos_nm, dtype=np.float64), cap_pos], axis=0
-            )
-            ctx.setPositions(full_pos * unit.nanometer)
-
-        ms = ctx.getState(getEnergy=True, getForces=True)
-        e = ms.getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)
-        f_full = ms.getForces(asNumpy=True).value_in_unit(
-            unit.kilojoule_per_mole / unit.nanometer
-        )
-        f_full = np.asarray(f_full, dtype=np.float64)
-
-        if K == 0:
-            f = f_full
-        else:
-            # Split host atoms vs cap atoms; redistribute cap forces
-            # onto Q,M using the same Jacobian as MACE's _computeMACE.
-            f = np.zeros((num_atoms, 3), dtype=np.float64)
-            f[:] = f_full[:num_atoms]
-            f_cap = f_full[num_atoms:num_atoms + K]
-            F_Q_add, F_M_add = redistribute_cap_force(
-                f_cap, r_Q, r_M, cap_C_L
-            )
-            # q_global / m_global are guaranteed unique by
-            # _prepareLinkRecords, so plain += is safe.
-            f[cap_info["q_global"]] += F_Q_add
-            f[cap_info["m_global"]] += F_M_add
-
-        # Sign flip: -E_MM(model), -F_MM(model)
-        return -float(e), -f
-
-    return closure
-
-
-# Register any potential functions defined by entry points.
+# Register any potential functions or embeddings defined by entry points.
 
 for potential in entry_points(group='openmmml.potentials'):
     MLPotential.registerImplFactory(potential.name, potential.load()())
+for embedding in entry_points(group='openmmml.embeddings'):
+    MLPotential.registerEmbeddingFactory(embedding.name, embedding.load()())

@@ -1,7 +1,7 @@
 """Unit tests for Z1 / DZ1 link-atom charge redistribution.
 
 Covers the new ``apply_link_charge_redistribution`` helper in
-``openmmml.embedding._links``. Does not exercise the full MACE stack —
+``openmmml.embeddings._links``. Does not exercise the full MACE stack —
 that's covered by the existing electrostatic-embedding smoke tests.
 """
 import numpy as np
@@ -10,7 +10,7 @@ import openmm.app as app
 from openmm.app import element as elem
 import pytest
 
-from openmmml.embedding._links import apply_link_charge_redistribution
+from openmmml.embeddings._links import apply_link_charge_redistribution
 
 
 # -----------------------------------------------------------------------------

@@ -110,12 +110,26 @@ When using MACE models, the following extra keyword arguments to `createSystem()
 ### AIMNet2
 
 The [aimnet](https://github.com/isayevlab/aimnetcentral) package can be used to create models using the pretrained
-[AIMNet2](https://doi.org/10.1039/D4SC08572H) potential.  The following model names
-are supported.
+[AIMNet2](https://doi.org/10.1039/D4SC08572H) potential.  This includes both the pretrained models and custom models you
+create yourself.  The following pretrained model families are supported.
 
 | Name | Model |
 | --- | --- |
-| `aimnet2` | Pretrained AIMNet2 models |
+| `aimnet2` | General organic and elemental-organic chemistry (wB97M-D3).  Covers H, B, C, N, O, F, Si, P, S, Cl, As, Se, Br, I |
+| `aimnet2-2025` | B97-3c with improved intermolecular interactions.  Same element coverage as `aimnet2` |
+| `aimnet2-nse` | Open-shell systems |
+| `aimnet2-pd` | Pd catalysis (B97-3c/CPCM(THF)).  Adds the Pd element (replaces As) |
+| `aimnet2-rxn` | Reactive chemistry, transition states, NEB/IRC.  Limited to net-neutral systems and H, C, N, O only |
+| `aimnet` | Custom AIMNet2 models specified with the `modelPath` argument |
+
+Each pretrained family is a four-member ensemble.  Pass the `modelIndex` argument (0 through 3) to `createSystem()`
+to select which member to use.  If it is omitted, member 0 is used by default.
+
+When creating AIMNet2 models, the following keyword arguments to the `MLPotential` constructor are supported.
+
+| Argument | Description |
+| --- | --- |
+| `modelPath` | For custom models (name `aimnet`), the path to the file containing the model |
 
 When using AIMNet2 models, the following extra keyword arguments to `createSystem()` and `createMixedSystem()` are supported.
 
@@ -123,6 +137,7 @@ When using AIMNet2 models, the following extra keyword arguments to `createSyste
 | --- | --- |
 | `charge` | The total charge of the system.  If omitted, it is assumed to be 0. |
 | `multiplicity` | The spin multiplicity of the system.  If omitted, it is assumed to be 1. |
+| `modelIndex` | For pretrained families, the ensemble member (0 through 3) to use.  If omitted, member 0 is used.  Not supported for custom models (name `aimnet`). |
 
 ### NequIP
 
@@ -225,10 +240,23 @@ When using TorchMD-Net models, the following extra keyword arguments to `createS
 | Argument | Description |
 | --- | --- |
 | `charge` | The total charge of the system.  If omitted, it is assumed to be 0. |
-| `coulomb_cutoff` | The cutoff distance to apply to Coulomb interactions, in nanometers.  If omitted, it defaults to 1.2 nm.  For models without an explicit Coulomb term, this is ignored. |
+| `coulomb_cutoff` | The cutoff distance to apply to Coulomb interactions, in nanometers.  If omitted, it defaults to 1.2 nm.  For models without an explicit Coulomb term, this is ignored.  Whether the cutoff is actually applied depends on `useCoulombCutoff` (see below). |
+| `useCoulombCutoff` | Override whether the Coulomb cutoff is applied.  If omitted, the default is determined automatically (see *Coulomb cutoff behavior* below).  Pass `True` to always apply the cutoff or `False` to disable it. |
 | `remove_ref_energy` | Argument passed to the TorchMD-Net model, please see [here](https://torchmd-net.readthedocs.io/en/latest/). Default is `True`.  |
 | `max_num_neighbors` | Argument passed to the TorchMD-Net model, please see [here](https://torchmd-net.readthedocs.io/en/latest/). Default is the minimum of 64 or the number of atoms in the molecule.
 | `batch` | Argument passed to the forward call of the TorchMD-Net model, please see [here](https://torchmd-net.readthedocs.io/en/latest/). With this argument you can denote different atoms to be in different batches. The format should be a 1d list containing the batch index of each atom. e.g. for two molecules each with three atoms to be treated as seperate batches you would pass `batch = [0, 0, 0, 1, 1, 1]`.
+
+#### Coulomb cutoff behaviour
+
+The Coulomb cutoff in TorchMD-Net uses a reaction-field approximation.  Applying it to a non-periodic
+system introduces errors, so by default the cutoff is only used when the system uses periodic
+boundary conditions.
+
+You can override this with the `useCoulombCutoff` argument if you know which behaviour you want:
+
+```python
+system = potential.createSystem(topology, useCoulombCutoff=False)
+```
 
 ### FeNNix
 
@@ -317,10 +345,42 @@ When using ASE models, the following extra keyword arguments to `createSystem()`
 | `aseAtoms` | An Atoms object to use for computations. |
 | `info` | Values that should be added to the `info` dict of the Atoms object. |
 
-### Other Packages
+## Embeddings
+
+For mixed ML/MM systems created with `createMixedSystem()`, the interactions within the ML subset will be computed by
+the selected MLIP, and the interactions within the MM subset will be computed by the MM force field.  However, OpenMM-ML
+offers various *embedding methods* that controls how the interactions between the ML and MM atoms are computed.
+
+By default, OpenMM-ML uses mechanical embedding, but this can be selected with the `embedding` argument to
+`createMixedSystem()`.  Embedding methods can either be generic methods available for use along with any MLIP (described
+below), or they can be specific to certain MLIPs.  You can retrieve the names of all acceptable embedding methods (both
+generic and specific) for a given MLIP by calling `MLPotential.getSupportedEmbeddings()`.  Consult the API documentation
+for more information about how the embedding API works internally and how custom embedding methods can be implemented.
+
+### Mechanical Embedding
+
+This default embedding method can also be explicitly selected with the embedding name `mechanical`.  Mechanical
+embedding uses the MM force field to compute the interactions between the ML and MM atoms.
+
+For periodic ML/MM systems, some MLIPs may compute the interactions between ML atoms including all periodic images;
+OpenMM-ML calls these models "long-range".  Other MLIPs may compute only the interactions between ML atoms in a single
+periodic image.  In this case, the interaction between the ML subset and all of its other periodic images is computed
+using the MM force field when using mechanical embedding.
+
+For the pretrained models supported by OpenMM-ML, this behavior is selected automatically.  However, for custom models
+(*e.g.*, the ASE, DeePMD, and NequIP interfaces, and non-pretrained FeNNix, MACE, and TorchMDNet models) it is necessary
+to specify which behavior your model uses when doing mechanical embedding in a periodic system.  To do so, pass
+`mlLongRange=False` to `createMixedSystem()` if your model is not long-range, and `mlLongRange=True` if it is.  An error
+will be raised to inform you if this information is needed and not provided; OpenMM-ML will not assume either choice
+automatically.
+
+## Other Packages
 
 OpenMM-ML is based on a plugin architecture, allowing other packages to provide their own interfaces to it.  The
-packages listed above are the ones for which OpenMM-ML has built in support.  Other packages can interface to it by
+packages listed above are the ones for which OpenMM-ML has built in support.  Other packages can provide potentials by
 defining two classes that subclass `MLPotentialImpl` and `MLPotentialImplFactory`, then registering them by specifying
 an [entry point](https://packaging.python.org/en/latest/specifications/entry-points/) in the group `openmmml.potentials`.
-Consult the documentation for other packages to see whether they provide interfaces for OpenMM-ML.
+They can also provide generic embedding methods (that can be used with any potential from OpenMM-ML or any other package)
+by similarly defining subclasses of `Embedding` and `EmbeddingFactory`, and registering them with an entry point in the
+group `openmmml.embeddings`.  Consult the documentation for other packages to see whether they provide interfaces for
+OpenMM-ML.

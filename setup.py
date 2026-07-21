@@ -6,7 +6,7 @@ from setuptools import setup, find_packages
 DOCLINES = __doc__.split("\n")
 
 ########################
-__version__ = '1.6'
+__version__ = '1.7'
 VERSION = __version__
 ISRELEASED = False
 ########################
@@ -38,10 +38,20 @@ setup(
     classifiers=CLASSIFIERS.splitlines(),
     packages=find_packages(),
     zip_safe=False,
-    install_requires=['numpy', 'openmm >= 8.5'],
+    install_requires=['numpy', 'openmm >= 8.5.2'],
     entry_points={
         'openmmml.potentials': [
+            # Custom AIMNet2 model supplied by path.
+            'aimnet = openmmml.models.aimnet2potential:AIMNet2PotentialImplFactory',
+            # AIMNet2 pretrained families.  Each family name is passed to
+            # AIMNet2Calculator, which resolves it to ensemble member 0.  A specific
+            # member (0..3) is selected with the modelIndex argument to createSystem()
+            # (see openmmml/models/aimnet2potential.py).
             'aimnet2 = openmmml.models.aimnet2potential:AIMNet2PotentialImplFactory',
+            'aimnet2-2025 = openmmml.models.aimnet2potential:AIMNet2PotentialImplFactory',
+            'aimnet2-nse = openmmml.models.aimnet2potential:AIMNet2PotentialImplFactory',
+            'aimnet2-pd = openmmml.models.aimnet2potential:AIMNet2PotentialImplFactory',
+            'aimnet2-rxn = openmmml.models.aimnet2potential:AIMNet2PotentialImplFactory',
             'ani1ccx = openmmml.models.anipotential:ANIPotentialImplFactory',
             'ani2x = openmmml.models.anipotential:ANIPotentialImplFactory',
             'ase = openmmml.models.asepotential:ASEPotentialImplFactory',
@@ -67,6 +77,10 @@ setup(
             'aceff-1.0 = openmmml.models.torchmdnetpotential:TorchMDNetPotentialImplFactory',
             'aceff-1.1 = openmmml.models.torchmdnetpotential:TorchMDNetPotentialImplFactory',
             'aceff-2.0 = openmmml.models.torchmdnetpotential:TorchMDNetPotentialImplFactory',
+        ],
+        'openmmml.embeddings': [
+            'mechanical = openmmml.embeddings.mechanicalembedding:MechanicalEmbeddingFactory',
+            'electrostatic = openmmml.embeddings.electrostaticembedding:ElectrostaticEmbeddingFactory',
         ]
     }
 )

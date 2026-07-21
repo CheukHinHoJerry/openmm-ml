@@ -141,7 +141,7 @@ def test_compute_cap_positions_q_to_l_distance_matches_target():
     (e.g. ``compute_cap_positions(r_Q, r_M, linkInfo['target_dist'] * 0.1)``)
     would slip past the loader-only test but trip this one.
     """
-    from openmmml.embedding._links import compute_cap_positions
+    from openmmml.embeddings._links import compute_cap_positions
 
     # Q at origin, M at (1.5, 0, 0) — a typical C-C single bond, 1.5 Å.
     r_Q = np.array([[0.0, 0.0, 0.0]])

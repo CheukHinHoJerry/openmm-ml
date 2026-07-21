@@ -111,6 +111,18 @@ class MACEPotentialImpl(MLPotentialImpl):
         The path to the locally trained MACE model if ``name`` is 'mace'.
     """
 
+    # (Function name, model name, restrictive license, long-range)
+    KNOWN_MODELS = {
+        'mace-off23-small': ('mace_off', 'small', True, False),
+        'mace-off23-medium': ('mace_off', 'medium', True, False),
+        'mace-off23-large': ('mace_off', 'large', True, False),
+        'mace-off24-medium': ('mace_off', 'https://github.com/ACEsuit/mace-off/blob/main/mace_off24/MACE-OFF24_medium.model?raw=true', True, False),
+        'mace-mpa-0-medium': ('mace_mp', 'medium-mpa-0', False, False),
+        'mace-omat-0-small': ('mace_mp', 'small-omat-0', True, False),
+        'mace-omat-0-medium': ('mace_mp', 'medium-omat-0', True, False),
+        'mace-omol-0-extra-large': ('mace_omol', 'extra_large', True, False),
+    }
+
     def __init__(self, name: str, modelPath) -> None:
         """
         Initialize the MACEPotentialImpl.
@@ -209,21 +221,17 @@ class MACEPotentialImpl(MLPotentialImpl):
 
         assert returnEnergyType in ["interaction_energy", "energy"], f"Unsupported returnEnergyType: '{returnEnergyType}'. Supported options are 'interaction_energy' or 'energy'."
 
-        models = {
-            'mace-off23-small': (mace_off, 'small', True),
-            'mace-off23-medium': (mace_off, 'medium', True),
-            'mace-off23-large': (mace_off, 'large', True),
-            'mace-off24-medium': (mace_off, 'https://github.com/ACEsuit/mace-off/blob/main/mace_off24/MACE-OFF24_medium.model?raw=true', True),
-            'mace-mpa-0-medium': (mace_mp, 'medium-mpa-0', False),
-            'mace-omat-0-small': (mace_mp, 'small-omat-0', True),
-            'mace-omat-0-medium': (mace_mp, 'medium-omat-0', True),
-            'mace-omol-0-extra-large': (mace_omol, 'extra_large', True)
-        }
+        # Load the model.
+
         device = self._getTorchDevice(args)
-        print(f"====== Running MACE potential on device: {device} =======")
-        if self.name in models:
-            fn, name, warn = models[self.name]
-            model = fn(model=name, device=device, return_raw_model=True).to(device)
+        if self.name in MACEPotentialImpl.KNOWN_MODELS:
+            functions = {
+                'mace_off': mace_off,
+                'mace_mp': mace_mp,
+                'mace_omol': mace_omol,
+            }
+            fnName, name, warn, _ = MACEPotentialImpl.KNOWN_MODELS[self.name]
+            model = functions[fnName](model=name, device=device, return_raw_model=True).to(device)
             if warn:
                 import logging
                 logging.warning(f'The model {self.name} is distributed under the restrictive ASL license.  Commercial use is not permitted.')
@@ -328,7 +336,7 @@ class MACEPotentialImpl(MLPotentialImpl):
             # OpenMM NonbondedForce, so MM-MM Coulomb stays bit-exact with the
             # original FF (standard practice).
             if linkInfo is not None and linkChargeScheme not in (None, "none"):
-                from openmmml.embedding._links import (
+                from openmmml.embeddings._links import (
                     apply_link_charge_redistribution as _apply_link_q,
                 )
                 mmInfo["mm_charges"] = _apply_link_q(
@@ -365,13 +373,19 @@ class MACEPotentialImpl(MLPotentialImpl):
         force.setUsesPeriodicBoundaryConditions(periodic)
         system.addForce(force)
 
+    def getMLLongRange(self) -> bool | None:
+        if self.name in MACEPotentialImpl.KNOWN_MODELS:
+            _, _, _, longRange = MACEPotentialImpl.KNOWN_MODELS[self.name]
+            return longRange
+        return None
+
 
 def _supports_mm_embedding(model) -> bool:
     return model.__class__.__name__ == "PolarMACE"
 
 
-_SUPPORTED_EMBEDDINGS = ("mechanical", "electrostatic", "oniom-electrostatic")
-_MM_EMBEDDING_MODES = ("electrostatic", "oniom-electrostatic")
+_SUPPORTED_EMBEDDINGS = ("mechanical", "electrostatic")
+_MM_EMBEDDING_MODES = ("electrostatic",)
 
 
 def _should_use_mm_embedding(model, atoms: Optional[Iterable[int]], embedding: str) -> bool:
@@ -381,11 +395,22 @@ def _should_use_mm_embedding(model, atoms: Optional[Iterable[int]], embedding: s
             + ", ".join(repr(m) for m in _SUPPORTED_EMBEDDINGS)
             + "."
         )
-    return (
-        _supports_mm_embedding(model)
-        and atoms is not None
-        and embedding in _MM_EMBEDDING_MODES
-    )
+    if embedding not in _MM_EMBEDDING_MODES:
+        return False
+    if not _supports_mm_embedding(model):
+        # The mixed system has had its ML-MM Coulomb removed on the assumption
+        # that the model will supply it, so falling back to mechanical
+        # embedding here would silently discard those interactions.
+        raise ValueError(
+            f"embedding='{embedding}' requires a model that accepts MM charges "
+            f"and positions (PolarMACE); got {model.__class__.__name__}."
+        )
+    if atoms is None:
+        raise ValueError(
+            f"embedding='{embedding}' requires an ML subset; it cannot be used "
+            "with createSystem()."
+        )
+    return True
 
 
 def _prepareMMEmbedding(system: openmm.System, atoms: Optional[Iterable[int]]):
@@ -480,7 +505,7 @@ def _computeMACE(state, model, ptr, node_attrs, batch, pbc, returnEnergyType, ch
     if linkInfo is not None:
         if indices is None:
             raise ValueError("linkRecords requires an explicit `atoms` subset.")
-        from openmmml.embedding._links import compute_cap_positions, minimum_image_M
+        from openmmml.embeddings._links import compute_cap_positions, minimum_image_M
         r_Q = positions_full[linkInfo["q_global"]]
         r_M = positions_full[linkInfo["m_global"]]
         if periodic:
@@ -547,7 +572,7 @@ def _computeMACE(state, model, ptr, node_attrs, batch, pbc, returnEnergyType, ch
         if linkInfo is None:
             f[indices] = forces
         else:
-            from openmmml.embedding._links import (
+            from openmmml.embeddings._links import (
                 compute_cap_positions,
                 minimum_image_M,
                 redistribute_cap_force,
