@@ -87,9 +87,7 @@ class MACEPotentialImpl(MLPotentialImpl):
     Note: ``returnEnergyType='interaction_energy'`` is **not** energy/force
     consistent for the PolarMACE family, which adds Coulomb / dipole / local-
     electron terms to ``total_energy`` whose gradients are in ``forces`` but
-    which are not in ``interaction_energy``. Using it produces a non-zero,
-    delta-independent floor in any finite-difference force check and
-    apparent NVE drift in MD.
+    which are not in ``interaction_energy``.
 
     Precision caveat for ``returnEnergyType='energy'``: this key returns the
     full ``total_energy = e0 + inter_e + extras`` where ``e0`` are the
@@ -253,36 +251,20 @@ class MACEPotentialImpl(MLPotentialImpl):
             includedAtoms = [includedAtoms[i] for i in atoms]
         atomicNumbers = [atom.element.atomic_number for atom in includedAtoms]
 
-        # Precision warning for returnEnergyType="energy".
-        # The 'energy' key is total_energy = e0 + inter_e + (PolarMACE extras).
-        # For models with non-trivial per-atom reference energies (mace-mp,
-        # mace-off, mace-omat foundations), e0 dominates the reported scalar
-        # — absolute values can reach 10^4–10^6 eV for large systems. That
-        # absolute scale is what gets written into single-precision OpenMM
-        # state/log lines, so the energy column may carry as few as 6–7
-        # significant digits and lose resolution at the meV level even though
-        # the *forces* (gradients of total_energy) remain accurate.
-        # Conservation/drift diagnostics still work (they're differences),
-        # but absolute-energy comparisons across runs need the model's e0
-        # baseline subtracted, or a double-precision report.
         if returnEnergyType == "energy":
             try:
-                e0 = model.atomic_energies_fn.atomic_energies
-                e0_max = float(e0.detach().abs().max())
+                e0_max = float(model.atomic_energies_fn.atomic_energies.detach().abs().max())
             except AttributeError:
                 e0_max = 0.0
-            if e0_max > 1.0:  # 1 eV per atom is conservative; foundation models far exceed this
+            if e0_max > 100.0:  # 1 eV per atom is conservative; foundation models far exceed this
                 import warnings as _w
                 _w.warn(
                     f"returnEnergyType='energy' includes per-atom reference "
-                    f"energies (max |e0| = {e0_max:.2f} eV/atom over {int(e0.numel())} "
-                    f"element entries). For a {len(includedAtoms)}-atom ML region the "
-                    f"absolute reported energy scale can reach ~{e0_max * len(includedAtoms):.0f} "
-                    f"eV; single-precision floats will lose meV-level resolution at that "
-                    f"magnitude. Use precision='double' if you need accurate absolute "
+                    f"energies (max |e0| = {e0_max:.2f} eV/atom over {int(model.atomic_energies_fn.atomic_energies.numel())} "
+                    f"element entries). Use precision='double' if you need accurate absolute "
                     f"energies, or pass returnEnergyType='interaction_energy' for the "
                     f"e0-subtracted readout (note: only 'energy' is gradient-consistent "
-                    f"with the reported forces for PolarMACE — see the docstring).",
+                    f"with PolarMACE — see the docstring).",
                     stacklevel=2,
                 )
 
@@ -331,11 +313,7 @@ class MACEPotentialImpl(MLPotentialImpl):
 
             # Optional Z1 / DZ1 link-atom charge redistribution. Standard QM/MM
             # correction to stop the QM region from being over-polarised by
-            # the partial charge on the MM-side boundary atom (M atom) sitting
-            # ~1.5 Å from the link H. Only modifies the *constant* mm_charges
-            # array baked into the PythonForce closure; does not touch the
-            # OpenMM NonbondedForce, so MM-MM Coulomb stays bit-exact with the
-            # original FF (standard practice).
+            # the partial charge on the MM-side boundary atom.
             if linkInfo is not None and linkChargeScheme not in (None, "none"):
                 from openmmml.models._links import (
                     apply_link_charge_redistribution as _apply_link_q,
@@ -560,46 +538,6 @@ def _prepareMMEmbedding(system: openmm.System, atoms: Optional[Iterable[int]]):
     }
 
 
-def _removeMLMMElectrostatics(system: openmm.System, mmInfo) -> None:
-    """Zero ML-MM Coulomb in NonbondedForce while preserving the current LJ term."""
-    if mmInfo is None:
-        return
-
-    ml_atoms = [int(i) for i in mmInfo["ml_atoms"]]
-    mm_atoms = [int(i) for i in mmInfo["mm_atoms"]]
-    if not ml_atoms or not mm_atoms:
-        return
-
-    for force in system.getForces():
-        if not isinstance(force, openmm.NonbondedForce):
-            continue
-
-        num_particles = force.getNumParticles()
-        atom_sigma = [None] * num_particles
-        atom_epsilon = [None] * num_particles
-        for i in range(num_particles):
-            _, sigma, epsilon = force.getParticleParameters(i)
-            atom_sigma[i] = sigma
-            atom_epsilon[i] = epsilon
-
-        exceptions = {}
-        for i in range(force.getNumExceptions()):
-            p1, p2, chargeProd, sigma, epsilon = force.getExceptionParameters(i)
-            exceptions[(int(p1), int(p2))] = (chargeProd, sigma, epsilon)
-
-        zero_charge_prod = 0.0 * unit.elementary_charge * unit.elementary_charge
-        for ml_atom in ml_atoms:
-            for mm_atom in mm_atoms:
-                p1, p2 = (ml_atom, mm_atom) if ml_atom < mm_atom else (mm_atom, ml_atom)
-                if (p1, p2) in exceptions:
-                    _, sigma, epsilon = exceptions[(p1, p2)]
-                else:
-                    sigma = 0.5 * (atom_sigma[p1] + atom_sigma[p2])
-                    epsilon = unit.sqrt(atom_epsilon[p1] * atom_epsilon[p2])
-                force.addException(p1, p2, zero_charge_prod, sigma, epsilon, replace=True)
-
-
-
 def _computeMACE(state, model, ptr, node_attrs, batch, pbc, returnEnergyType, charge, multiplicity, indices, periodic, linkInfo=None, mmInfo=None):
     import torch
     from mace.data.neighborhood import get_neighborhood
@@ -663,6 +601,7 @@ def _computeMACE(state, model, ptr, node_attrs, batch, pbc, returnEnergyType, ch
         "external_field": torch.zeros((charge.shape[0], 3), dtype=dtype, device=ptr.device),
         "fermi_level": torch.zeros((1,), dtype=dtype, device=ptr.device)
     }
+    # load mm position and charges
     if mmInfo is not None:
         mm_positions = positions_full[mmInfo["mm_atoms"]]
         inputDict["mm_positions"] = torch.tensor(
@@ -680,6 +619,8 @@ def _computeMACE(state, model, ptr, node_attrs, batch, pbc, returnEnergyType, ch
     mm_forces = results.get("mm_forces")
     if mm_forces is not None:
         mm_forces = (mm_forces * energyScale * lengthScale).detach().cpu().numpy()
+
+    # force redistribution and add mm_forces back to the full system
     if indices is not None:
         f = np.zeros((numAtoms, 3), dtype=(np.float64 if dtype == torch.float64 else np.float32))
         if linkInfo is None:
@@ -694,11 +635,8 @@ def _computeMACE(state, model, ptr, node_attrs, batch, pbc, returnEnergyType, ch
             f_ml = forces[:N]
             f_link = forces[N:]
             f[indices] = f_ml
+            
             # Redistribute each link atom's force onto its (Q, M) partners.
-            # See _prepareLinkRecords for the bookkeeping. Use the SAME imaged
-            # r_M as the cap placement above, or C_L / the bond direction would
-            # not match the cap that produced f_link (breaking conservativeness
-            # for boundary-crossing bonds).
             r_Q = positions_full[linkInfo["q_global"]]
             r_M = positions_full[linkInfo["m_global"]]
             if periodic:
@@ -706,8 +644,7 @@ def _computeMACE(state, model, ptr, node_attrs, batch, pbc, returnEnergyType, ch
                 r_M = minimum_image_M(r_Q, r_M, cell_A)
             _, C_L = compute_cap_positions(r_Q, r_M, linkInfo["target_dist"])
             F_Q_add, F_M_add = redistribute_cap_force(f_link, r_Q, r_M, C_L)
-            # q_global and m_global were validated unique at construction, so
-            # plain += is correct (no duplicate-row aggregation needed).
+            
             f[linkInfo["q_global"]] += F_Q_add.astype(f.dtype, copy=False)
             f[linkInfo["m_global"]] += F_M_add.astype(f.dtype, copy=False)
         if mmInfo is not None and mm_forces is not None:

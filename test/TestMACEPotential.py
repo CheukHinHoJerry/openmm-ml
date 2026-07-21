@@ -12,7 +12,6 @@ from openmmml.models.macepotential import (
     MACEPotentialImpl,
     _computeMACE,
     _prepareMMEmbedding,
-    _removeMLMMElectrostatics,
     _should_use_mm_embedding,
 )
 
@@ -41,35 +40,14 @@ def _simple_nonbonded_system():
     return system, nonbonded
 
 
-def testPrepareMMEmbeddingAndRemoveMLMMElectrostatics():
+def testPrepareMMEmbedding():
+    """The MM complement and its charges are read off the NonbondedForce."""
     system, nonbonded = _simple_nonbonded_system()
     info = _prepareMMEmbedding(system, [0, 1])
     assert info is not None
     np.testing.assert_array_equal(info["ml_atoms"], [0, 1])
     np.testing.assert_array_equal(info["mm_atoms"], [2])
     np.testing.assert_allclose(info["mm_charges"], [0.25], atol=1e-12)
-
-    _removeMLMMElectrostatics(system, info)
-
-    expected_sigma_02 = 0.5 * (0.30 + 0.50)
-    expected_sigma_12 = 0.5 * (0.40 + 0.50)
-    expected_eps_02 = np.sqrt(0.20 * 0.80)
-    expected_eps_12 = np.sqrt(0.50 * 0.80)
-    seen = {}
-    for i in range(nonbonded.getNumExceptions()):
-        p1, p2, chargeProd, sigma, epsilon = nonbonded.getExceptionParameters(i)
-        seen[(int(p1), int(p2))] = (
-            chargeProd.value_in_unit(unit.elementary_charge * unit.elementary_charge),
-            sigma.value_in_unit(unit.nanometer),
-            epsilon.value_in_unit(unit.kilojoule_per_mole),
-        )
-
-    assert seen[(0, 2)][0] == pytest.approx(0.0, abs=1e-12)
-    assert seen[(1, 2)][0] == pytest.approx(0.0, abs=1e-12)
-    assert seen[(0, 2)][1] == pytest.approx(expected_sigma_02, abs=1e-12)
-    assert seen[(1, 2)][1] == pytest.approx(expected_sigma_12, abs=1e-12)
-    assert seen[(0, 2)][2] == pytest.approx(expected_eps_02, abs=1e-12)
-    assert seen[(1, 2)][2] == pytest.approx(expected_eps_12, abs=1e-12)
 
 
 class _FakeState:
