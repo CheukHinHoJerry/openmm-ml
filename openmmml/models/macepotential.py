@@ -626,13 +626,11 @@ def _prepareLinkRecords(linkRecords, atoms, topology, system):
         raise ValueError("linkRecords requires an explicit `atoms` subset.")
 
     if isinstance(linkRecords, (str, Path)):
-        # capping_mapping.csv (from cli/oniom/cap_qm_boundary.py) is 1-based:
-        # read (q_idx1, m_idx1, target_dist_ang) and convert to 0-based OpenMM
-        # indices. target_dist stays in Angstroms (canonical — matches the
-        # MACE-side `positions_full` in Å; the oniom-electrostatic closure
-        # converts Å→nm at the point of use). Self-contained so openmm-ml does
-        # not depend on mlmm for the CSV path. Cap positions are not stored in
-        # the CSV; they are recomputed each step from (q, m, target_dist).
+        # A capping-mapping CSV is 1-based: read (q_idx1, m_idx1,
+        # target_dist_ang) and convert to 0-based OpenMM indices. target_dist
+        # stays in Angstroms, canonical because it matches the MACE-side
+        # `positions_full`. Cap positions are not stored in the CSV; they are
+        # recomputed each step from (q, m, target_dist).
         import csv as _csv
         tuples = []
         with open(linkRecords, newline="") as _f:

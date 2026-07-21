@@ -6,17 +6,11 @@ Q (ML-side) and M (MM-side) atom positions; their forces from the
 ML evaluator must be redistributed onto Q and M before being handed
 back to OpenMM.
 
-Two callers:
-
-- `openmmml/models/macepotential.py::_computeMACE` — places caps in
-  MACE's input each step and redistributes forces from MACE's output.
-- `openmmml/mlpotential.py::_build_oniom_mixed_system` — places caps
-  in the ONIOM low-model `Context` each step and redistributes forces
-  from the model `Context`'s output.
-
-Both call sites need the *same* placement formula and the *same*
-redistribution Jacobian, so the math lives here and both import it.
-The math:
+The caller is `openmmml/models/macepotential.py::_computeMACE`, which
+places caps in MACE's input each step and redistributes forces from
+MACE's output.  The math lives here rather than there so that any
+further evaluator needing caps uses the *same* placement formula and
+the *same* redistribution Jacobian:
 
     r_cap = (1 - C_L) * r_Q + C_L * r_M       where  C_L = target_dist / |r_M - r_Q|
 

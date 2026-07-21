@@ -1,8 +1,8 @@
 """Regression test for the `target_dist` unit canonicalisation in
 `_prepareLinkRecords` and its downstream consumers.
 
-The historical bug (R4 in the MLMM `TODO/oniom_parity_pr19_review.md`):
-when `linkRecords` was loaded from a `capping_mapping.csv`, the loader
+The historical bug: when `linkRecords` was loaded from a
+`capping_mapping.csv`, the loader
 multiplied the CSV's `target_dist_ang` column by 0.1 — turning a 1.09 Å
 record into a 0.109 nm record stored in `linkInfo["target_dist"]`. But
 `_computeMACE` reads `linkInfo["target_dist"]` together with `r_Q`,
@@ -12,10 +12,7 @@ caps at ~0.1 Å from the Q atom — about 10× closer than the intended
 ~1.09 Å (typical C-H bond).
 
 The fix: `linkInfo["target_dist"]` is canonically in **Å**. The CSV path
-no longer multiplies by 0.1; the tuple path was already in Å. The
-oniom-electrostatic closure's `cap_info["target_dist"]` is converted to
-nm by `_oniom_normalize_caps` (existing code, unchanged) so closure
-positions stay in nm.
+no longer multiplies by 0.1; the tuple path was already in Å.
 
 Tests in this file pin the contract at three levels so a regression on
 *any* of them surfaces clearly:
@@ -27,10 +24,6 @@ Tests in this file pin the contract at three levels so a regression on
    target value. Any future "fix" that re-introduces `* 0.1` at the
    consumer side (instead of the loader side) trips this end-to-end
    case even if it leaves the loader unchanged.
-4. ONIOM oniom-electrostatic closure: `_oniom_normalize_caps` converts
-   Å→nm exactly once for `cap_info["target_dist"]`. Any future change
-   that drops this conversion (i.e. assumes `cap_info` is in Å) would
-   break the closure's nm-scale `compute_cap_positions` call.
 """
 from __future__ import annotations
 
@@ -152,27 +145,3 @@ def test_compute_cap_positions_q_to_l_distance_matches_target():
     q_to_l = np.linalg.norm(cap_pos - r_Q, axis=-1)
     np.testing.assert_allclose(q_to_l, target_dist_ang, atol=1e-12)
     np.testing.assert_allclose(C_L, target_dist_ang / 1.5, atol=1e-12)
-
-
-def test_oniom_normalize_caps_converts_angstrom_to_nm(tiny_system_topology):
-    """oniom-electrostatic closure contract: `cap_info['target_dist']` must
-    be in nm, computed from `link_info['target_dist']` (Å) by *exactly one*
-    factor of 0.1.
-
-    Catches a future regression that drops the Å→nm conversion in
-    `_oniom_normalize_caps` (which would feed Å-scale target_dist into the
-    nm-scale `compute_cap_positions` call in the closure).
-    """
-    from openmmml.mlpotential import MLPotential
-
-    top, system = tiny_system_topology
-    cap_info = MLPotential._oniom_normalize_caps(
-        link_records_arg=[(2, 3, 1.09)],
-        cap_mm_params_arg=None,
-        system=system,
-        atomList=[0, 1, 2],
-        topology=top,
-        mergedArgs={},
-    )
-    assert cap_info is not None
-    np.testing.assert_allclose(cap_info["target_dist"], np.array([0.109]), atol=1e-12)
