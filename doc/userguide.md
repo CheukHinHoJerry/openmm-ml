@@ -102,7 +102,10 @@ When using MACE models, the following extra keyword arguments to `createSystem()
 | Argument | Description |
 | --- | --- |
 | `precision` | The numerical precision of the model. Supported options are `'single'` and `'double'`.  If `None`, the default precision of the model is used. |
-| `returnEnergyType` | Whether to return the interaction energy or the energy including the self-energy.  The default is `'interaction_energy'`. Supported options are `'interaction_energy'` and `'energy'`. |
+| `returnEnergyType` | Whether to return the interaction energy or the energy including the self-energy.  The default is `'energy'`, which is the scalar the reported forces are the gradient of, so the potential is conservative.  Supported options are `'interaction_energy'` and `'energy'`. |
+| `linkRecords` | Hydrogen link atoms to cap covalent bonds crossing the ML/MM boundary; see *Link atoms* below.  Only meaningful for `createMixedSystem()`. |
+| `linkChargeScheme` | How to treat the MM charges on the MM-side boundary atoms when `linkRecords` is given; see *Link atoms* below.  The default is `'dz1'`. |
+| `embedding` | Passed by the embedding method rather than by you; see *Embeddings* below. |
 | `device` | The PyTorch device to perform calculations on, either a `torch.device` object or a string (such as `'cuda'` or `'cpu'`.)  If omitted, a device is chosen automatically. |
 | `charge` | The total charge of the system.  If omitted, it is assumed to be 0.  This is only used by MACE-OMOL-0.  For other models it is ignored. |
 | `multiplicity` | The spin multiplicity of the system.  If omitted, it is assumed to be 1.  This is only used by MACE-OMOL-0.  For other models it is ignored.  |
@@ -373,6 +376,53 @@ to specify which behavior your model uses when doing mechanical embedding in a p
 `mlLongRange=False` to `createMixedSystem()` if your model is not long-range, and `mlLongRange=True` if it is.  An error
 will be raised to inform you if this information is needed and not provided; OpenMM-ML will not assume either choice
 automatically.
+
+### Electrostatic Embedding
+
+This is a potential-specific embedding method provided by the MACE interface rather than a generic one, and it is
+selected with the embedding name `electrostatic`.  The MLIP, rather than the MM force field, computes the electrostatic
+interactions between the ML and MM atoms: it is given the positions and MM force field charges of the MM atoms, and
+returns forces on them alongside the forces on the ML atoms.  The ML subset can therefore polarise in response to its
+surroundings, which mechanical embedding does not allow.  Lennard-Jones interactions between the ML and MM atoms are
+still computed by the MM force field, as are all bonded terms that cross the ML/MM boundary.
+
+This is implemented by setting the MM force field charge of every ML atom to zero, so that every Coulomb term involving
+an ML atom vanishes, including the reciprocal space part of PME.  As a result, the MM force field's own charges are
+untouched and MM-MM electrostatics are unchanged.
+
+Only models that accept MM charges and positions can be used with this embedding method; at present that means PolarMACE
+checkpoints, loaded with the model name `mace` and a `modelPath`.  None of the pretrained foundation models accept them,
+so none of them offer this embedding method, and `getSupportedEmbeddings()` will not list it for those.  For a custom
+checkpoint it is listed, since whether the checkpoint is a PolarMACE model cannot be known until it is loaded; if it
+turns out not to be, an error is raised at that point rather than silently falling back to mechanical embedding, since
+the mixed system has already had its ML-MM electrostatics removed and a fallback would simply lose them.
+Interpolation is not supported, because at `lambda_interpolate=0` the ML-MM electrostatics would be missing from the MM
+endpoint.
+
+```python
+system = potential.createMixedSystem(topology, mm_system, ml_atoms, embedding='electrostatic')
+```
+
+#### Link atoms
+
+When the ML subset is carved out of the middle of a molecule, the covalent bonds crossing the boundary leave the ML
+atoms with dangling valences.  The MACE interface can cap each such bond with a hydrogen link atom, placed along the
+bond vector at every force evaluation and with its forces redistributed onto the two real atoms it sits between, so the
+capped system stays conservative.  Caps are requested with the `linkRecords` argument to `createMixedSystem()`, which
+takes a sequence of `(q, m, target_dist)` tuples — `q` is the ML-side atom index, `m` the MM-side atom index, and
+`target_dist` the desired cap distance from `q` in Ångströms — or the path to a CSV file with `q_idx1`, `m_idx1`, and
+`target_dist_ang` columns.  Note that the tuples are 0-based, matching OpenMM's atom indices, while the CSV columns are
+1-based, hence their names.
+
+The MM partial charge on each MM-side boundary atom would otherwise sit about 1.5 Å from the nearest ML atom, through
+the cap, and over-polarise it.  The `linkChargeScheme` argument controls how that charge is handled, affecting only the
+charges passed to the MLIP; the MM `NonbondedForce` is left alone, so MM-MM electrostatics remain exact.
+
+| `linkChargeScheme` | Description |
+| --- | --- |
+| `'dz1'` | The default.  Sets the MM-side boundary atom charge to zero and spreads it evenly over that atom's MM neighbours, conserving total charge.  Falls back to `'z1'`, with a warning, for a boundary atom with no MM neighbours. |
+| `'z1'` | Sets the MM-side boundary atom charge to zero without redistributing it, which changes the total charge. |
+| `'none'` | Leaves the MM charges untouched. |
 
 ## Other Packages
 
