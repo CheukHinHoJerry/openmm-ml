@@ -9,6 +9,7 @@ import torch
 
 from openmmml import MLPotential
 from openmmml.models.macepotential import (
+    MACEPotentialImpl,
     _computeMACE,
     _prepareMMEmbedding,
     _removeMLMMElectrostatics,
@@ -165,6 +166,17 @@ def testElectrostaticEmbeddingRejectsUnsupportedCases():
         _should_use_mm_embedding(MACE(), [0, 1], "electrostatic")
     with pytest.raises(ValueError, match="requires an ML subset"):
         _should_use_mm_embedding(PolarMACE(), None, "electrostatic")
+
+
+def testOnlyCustomModelsOfferElectrostaticEmbedding():
+    """None of the pretrained foundation models accept MM charges, so none of
+    them should advertise electrostatic embedding.  Only a custom checkpoint can
+    be a PolarMACE model, so only those offer it."""
+    for name in MACEPotentialImpl.KNOWN_MODELS:
+        assert MLPotential(name).getSupportedEmbeddings() == ['mechanical'], name
+    custom = MLPotential('mace', modelPath='unused-until-forces-are-added.model')
+    assert 'electrostatic' in custom.getSupportedEmbeddings()
+
 
 @pytest.mark.parametrize("platform_int", list(platform_ints))
 class TestMACE:

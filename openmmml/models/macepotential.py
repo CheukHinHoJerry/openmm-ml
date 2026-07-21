@@ -381,6 +381,15 @@ class MACEPotentialImpl(MLPotentialImpl):
         return None
 
     def getSupportedEmbeddings(self) -> list[str]:
+
+        # Electrostatic embedding requires a model that accepts MM charges and
+        # positions, which none of the pretrained foundation models do.  Only a
+        # custom checkpoint can be one, so only for those is the method offered
+        # here; whether the checkpoint really is one is checked when it is
+        # loaded, since that is the first point at which it can be.
+
+        if self.name in MACEPotentialImpl.KNOWN_MODELS:
+            return []
         return ["electrostatic"]
 
     def createMixedSystem(self,

@@ -379,8 +379,8 @@ automatically.
 
 ### Electrostatic Embedding
 
-This is a potential-specific embedding method provided by the MACE interface, rather than a generic one, so it is only
-available for MACE models.  It is selected with the embedding name `electrostatic`.  The MLIP, rather than the MM force field, computes the electrostatic
+This is a potential-specific embedding method provided by the MACE interface rather than a generic one, and it is
+selected with the embedding name `electrostatic`.  The MLIP, rather than the MM force field, computes the electrostatic
 interactions between the ML and MM atoms: it is given the positions and MM force field charges of the MM atoms, and
 returns forces on them alongside the forces on the ML atoms.  The ML subset can therefore polarise in response to its
 surroundings, which mechanical embedding does not allow.  Lennard-Jones interactions between the ML and MM atoms are
@@ -390,9 +390,12 @@ This is implemented by setting the MM force field charge of every ML atom to zer
 an ML atom vanishes, including the reciprocal space part of PME.  As a result, the MM force field's own charges are
 untouched and MM-MM electrostatics are unchanged.
 
-Only MLIPs that accept MM charges and positions can be used with this embedding method; at present that means PolarMACE
-models loaded through the `mace` interface.  An error is raised if the model cannot accept them, rather than silently
-falling back to mechanical embedding, since the mixed system has already had its ML-MM electrostatics removed.
+Only models that accept MM charges and positions can be used with this embedding method; at present that means PolarMACE
+checkpoints, loaded with the model name `mace` and a `modelPath`.  None of the pretrained foundation models accept them,
+so none of them offer this embedding method, and `getSupportedEmbeddings()` will not list it for those.  For a custom
+checkpoint it is listed, since whether the checkpoint is a PolarMACE model cannot be known until it is loaded; if it
+turns out not to be, an error is raised at that point rather than silently falling back to mechanical embedding, since
+the mixed system has already had its ML-MM electrostatics removed and a fallback would simply lose them.
 Interpolation is not supported, because at `lambda_interpolate=0` the ML-MM electrostatics would be missing from the MM
 endpoint.
 
