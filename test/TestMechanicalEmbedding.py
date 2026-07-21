@@ -210,3 +210,41 @@ class TestMechanicalEmbedding:
             assert (atom_1, atom_2) in mm_constraints or (atom_2, atom_1) in mm_constraints
             if atom_1 in subset_set and atom_2 in subset_set:
                 assert ((atom_1, atom_2) in mixed_constraints or (atom_2, atom_1) in mixed_constraints) != remove
+
+
+def testCustomNonbondedForce():
+    """Mechanical embedding must handle a System containing a
+    CustomNonbondedForce by excluding the ML-ML pairs from it."""
+    import openmm
+    from openmmml import MLPotential
+
+    numParticles = 4
+    mlAtoms = [0, 1]
+    system = openmm.System()
+    nonbonded = openmm.NonbondedForce()
+    custom = openmm.CustomNonbondedForce("4*epsilon*((sigma/r)^12-(sigma/r)^6)")
+    custom.addPerParticleParameter("sigma")
+    custom.addPerParticleParameter("epsilon")
+    for _ in range(numParticles):
+        system.addParticle(1.0)
+        nonbonded.addParticle(0.0, 0.3, 0.2)
+        custom.addParticle([0.3, 0.2])
+    system.addForce(nonbonded)
+    system.addForce(custom)
+
+    topology = openmm.app.Topology()
+    chain = topology.addChain()
+    residue = topology.addResidue("X", chain)
+    for i in range(numParticles):
+        topology.addAtom(f"H{i}", openmm.app.element.hydrogen, residue)
+
+    mixed = MLPotential("mace-off23-small").createMixedSystem(
+        topology, system, mlAtoms)
+
+    mixedCustom = next(f for f in mixed.getForces()
+                       if isinstance(f, openmm.CustomNonbondedForce))
+    exclusions = {
+        tuple(sorted(mixedCustom.getExclusionParticles(i)))
+        for i in range(mixedCustom.getNumExclusions())
+    }
+    assert tuple(sorted(mlAtoms)) in exclusions

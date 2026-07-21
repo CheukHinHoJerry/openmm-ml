@@ -217,3 +217,41 @@ class TestMACE:
         interpEnergy2 = interpContext.getState(getEnergy=True).getPotentialEnergy().value_in_unit(unit.kilojoules_per_mole)
         assert np.isclose(mixedEnergy, interpEnergy1, rtol=1e-5)
         assert np.isclose(mmEnergy, interpEnergy2, rtol=1e-5)
+
+
+def testMissingMMForcesIsAnError():
+    """A model given MM charges must return forces on the MM atoms.
+
+    createMixedSystem has already removed the ML-MM electrostatics from the
+    force field, so a model that computes nothing in their place leaves them
+    missing altogether. That has to be an error: it is indistinguishable from
+    success at every other level, and produces a system with no ML-MM
+    electrostatics at all.
+    """
+    class _NoMMForces(_FakeModel):
+        """Stands in for a PolarMACE whose forward ignores mm_charges.
+
+        Same as _FakeModel except that it never returns mm_forces, which is what
+        a PolarMACE checkpoint does when its forward does not accept mm_charges.
+        """
+        def __call__(self, inputDict, compute_force=True):
+            out = super().__call__(inputDict, compute_force)
+            out.pop("mm_forces", None)
+            return out
+
+    mmInfo = {"mm_atoms": np.array([2], dtype=np.int64),
+              "mm_charges": np.array([0.25], dtype=np.float64)}
+    with pytest.raises(ValueError, match="no 'mm_forces'"):
+        _computeMACE(
+            state=_FakeState([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [3.0, 0.0, 0.0]]),
+            model=_NoMMForces(dtype=torch.float32),
+            ptr=torch.tensor([0, 2], dtype=torch.long),
+            node_attrs=torch.ones((2, 1), dtype=torch.float32),
+            batch=torch.zeros(2, dtype=torch.long),
+            pbc=torch.tensor([False, False, False], dtype=torch.bool),
+            returnEnergyType="interaction_energy",
+            charge=torch.tensor([0.0], dtype=torch.float32),
+            multiplicity=torch.tensor([1.0], dtype=torch.float32),
+            indices=np.array([0, 1], dtype=np.int64), periodic=False,
+            linkInfo=None, mmInfo=mmInfo,
+        )

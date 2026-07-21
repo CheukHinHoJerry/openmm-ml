@@ -378,3 +378,129 @@ def test_reciprocal_space_pme_matches_mm_only_reference():
     e_ref = ctx_ref.getState(getEnergy=True).getPotentialEnergy().value_in_unit(unit.kilojoule_per_mole)
 
     assert e_mixed == pytest.approx(e_ref, rel=1e-6, abs=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# Electrostatics the surgery cannot account for.
+#
+# The ML-MM Coulomb is removed from the force field on the understanding that
+# the model supplies it. Any Coulomb term this method cannot find is either left
+# in place and counted twice, or removed and never replaced. Both give a wrong
+# energy with no error, so these cases are refused rather than guessed at.
+# ---------------------------------------------------------------------------
+
+
+def _minimal_topology(numParticles):
+    from openmm.app import element
+
+    topology = app.Topology()
+    chain = topology.addChain()
+    residue = topology.addResidue("X", chain)
+    for i in range(numParticles):
+        topology.addAtom(f"H{i}", element.hydrogen, residue)
+    return topology
+
+
+def _createMixedSystem(system, **args):
+    impl = _NoopImpl()
+    return impl.createMixedSystem(
+        _minimal_topology(system.getNumParticles()), system, _ML_ATOMS, 0, False,
+        "electrostatic", **args,
+    )
+
+
+def test_multiple_nonbonded_forces_rejected():
+    """The MM charges given to the model come from one NonbondedForce, so more
+    than one is ambiguous: the surgery would zero ML charges in all of them
+    while the model saw the charges of only the first."""
+    system = _build_periodic_system()
+    system.addForce(openmm.NonbondedForce())
+    with pytest.raises(ValueError, match="Multiple NonbondedForce"):
+        _createMixedSystem(system)
+
+
+def _addCoulombCustomNonbondedForce(system):
+    force = openmm.CustomNonbondedForce("138.935456*q1*q2/r")
+    force.addPerParticleParameter("q")
+    for index in range(system.getNumParticles()):
+        force.addParticle([_PARAMS[index][1]])
+    system.addForce(force)
+    return system
+
+
+def test_custom_nonbonded_force_requires_an_answer():
+    """A CustomNonbondedForce's energy expression is arbitrary, so whether it
+    carries electrostatics cannot be determined here and must be declared."""
+    system = _addCoulombCustomNonbondedForce(_build_periodic_system())
+    with pytest.raises(ValueError, match="unknown whether it includes electrostatic"):
+        _createMixedSystem(system)
+
+
+def test_custom_nonbonded_force_with_charges_needs_the_parameter_name():
+    """Declaring that it does carry electrostatics is not enough on its own:
+    the charge cannot be zeroed without knowing which parameter holds it."""
+    system = _addCoulombCustomNonbondedForce(_build_periodic_system())
+    with pytest.raises(ValueError, match="must name the per-particle parameter"):
+        _createMixedSystem(system, customNonbondedHasCharges=True)
+
+
+def test_custom_nonbonded_force_unknown_parameter_name_rejected():
+    """Naming a parameter the force does not define is an error, not a no-op
+    that would leave the electrostatics in place."""
+    system = _addCoulombCustomNonbondedForce(_build_periodic_system())
+    with pytest.raises(ValueError, match="no per-particle parameter"):
+        _createMixedSystem(system, customNonbondedHasCharges=True,
+                           customNonbondedChargeParameter="charge")
+
+
+def test_custom_nonbonded_charge_parameter_zeroed_on_ml_atoms():
+    """Naming the charge parameter zeroes it on the ML atoms, which removes the
+    ML-MM Coulomb the custom force would otherwise still contribute."""
+    system = _addCoulombCustomNonbondedForce(_build_periodic_system())
+    mixed = _createMixedSystem(system, customNonbondedHasCharges=True,
+                               customNonbondedChargeParameter="q")
+    custom = next(f for f in mixed.getForces() if isinstance(f, openmm.CustomNonbondedForce))
+    for atom in _ML_ATOMS:
+        assert custom.getParticleParameters(atom)[0] == pytest.approx(0.0, abs=1e-12)
+    for atom in _MM_ATOMS:
+        assert custom.getParticleParameters(atom)[0] == pytest.approx(_PARAMS[atom][1], rel=1e-12)
+
+
+def test_custom_nonbonded_force_without_charges_accepted():
+    """Declaring it carries none proceeds, with ML-ML excluded as usual."""
+    system = _addCoulombCustomNonbondedForce(_build_periodic_system())
+    mixed = _createMixedSystem(system, customNonbondedHasCharges=False)
+    custom = next(f for f in mixed.getForces() if isinstance(f, openmm.CustomNonbondedForce))
+    exclusions = {
+        tuple(sorted(custom.getExclusionParticles(i)))
+        for i in range(custom.getNumExclusions())
+    }
+    assert tuple(sorted(_ML_ATOMS)) in exclusions
+
+
+def test_custom_nonbonded_charges_reach_the_model():
+    """When the electrostatics live in the CustomNonbondedForce, the charges the
+    model is given must come from there too.
+
+    Reading them from the NonbondedForce in that case hands the model zeros
+    while the surgery has already removed the real ML-MM Coulomb, so the
+    interaction disappears rather than being computed by the model.
+    """
+    from openmmml.models.macepotential import _prepareMMEmbedding
+
+    system = openmm.System()
+    for _ in range(4):
+        system.addParticle(1.0)
+    lj = openmm.NonbondedForce()          # Lennard-Jones only, no charges
+    for _, _, sigma, epsilon in _PARAMS:
+        lj.addParticle(0.0, sigma, epsilon)
+    system.addForce(lj)
+    coulomb = openmm.CustomNonbondedForce("138.935456*q1*q2/r")
+    coulomb.addPerParticleParameter("q")
+    for _, charge, _, _ in _PARAMS:
+        coulomb.addParticle([charge])
+    system.addForce(coulomb)
+
+    expected = [_PARAMS[i][1] for i in _MM_ATOMS]
+    charges = _prepareMMEmbedding(system, _ML_ATOMS, "q")["mm_charges"]
+    np.testing.assert_allclose(charges, expected, atol=1e-12)

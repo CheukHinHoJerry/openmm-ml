@@ -28,6 +28,7 @@ DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR
 OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
 USE OR OTHER DEALINGS IN THE SOFTWARE.
 """
+import os
 import openmm
 from openmm import unit
 from openmmml.mlpotential import MLPotential, MLPotentialImpl, MLPotentialImplFactory
@@ -203,6 +204,7 @@ class MACEPotentialImpl(MLPotentialImpl):
         linkRecords: LinkRecordsArg = None,
         linkChargeScheme: str = "dz1",
         embedding: str = "mechanical",
+        customNonbondedChargeParameter: Optional[str] = None,
         **args,
     ) -> None:
         """
@@ -343,7 +345,7 @@ class MACEPotentialImpl(MLPotentialImpl):
             # ML-MM Coulomb is removed by MLPotential.createMixedSystem when
             # embedding='electrostatic'. We only need MM positions/charges for
             # the PolarMACE input here.
-            mmInfo = _prepareMMEmbedding(system, atoms)
+            mmInfo = _prepareMMEmbedding(system, atoms, customNonbondedChargeParameter)
 
             # Optional Z1 / DZ1 link-atom charge redistribution. Standard QM/MM
             # correction to stop the QM region from being over-polarised by
@@ -408,6 +410,8 @@ class MACEPotentialImpl(MLPotentialImpl):
                           forceGroup: int,
                           interpolate: bool,
                           embedding: str,
+                          customNonbondedHasCharges: Optional[bool] = None,
+                          customNonbondedChargeParameter: Optional[str] = None,
                           **args) -> openmm.System:
         """Create a mixed system using electrostatic embedding.
 
@@ -441,6 +445,24 @@ class MACEPotentialImpl(MLPotentialImpl):
         embedding, since by that point the ML-MM electrostatics have already
         been removed from the conventional force field and a fallback would
         simply lose them.
+
+        Because this method has to account for every Coulomb term in the force
+        field, it requires the System to contain exactly one NonbondedForce: the
+        MM charges given to the model are read from one, so several would be
+        ambiguous.
+
+        It also needs to be told about any CustomNonbondedForce, whose energy
+        expression is arbitrary and cannot be inspected here.  Pass
+        customNonbondedHasCharges=False to declare that it holds no
+        electrostatics, or True together with customNonbondedChargeParameter
+        naming the per-particle parameter that holds the charge, which is then
+        zeroed on the ML atoms exactly as for the NonbondedForce.  An error is
+        raised if the answer is needed and has not been given.
+
+        Note that zeroing that parameter removes the ML terms only if the
+        expression is multiplicatively separable in the charge, as the usual
+        q1*q2/r is.  That cannot be verified here, so it is the caller's
+        responsibility.
         """
 
         if embedding != "electrostatic":
@@ -468,6 +490,28 @@ class MACEPotentialImpl(MLPotentialImpl):
             raise ValueError("Electrostatic embedding does not support interpolation.")
 
         periodic = system.usesPeriodicBoundaryConditions()
+
+        # Electrostatic embedding has to account for every Coulomb term in the
+        # force field: the ones involving the ML subset are removed here on the
+        # understanding that the model supplies them.  Anything it cannot see is
+        # either left in place and counted twice, or removed and never replaced,
+        # and in both cases the result is a wrong energy rather than an error.
+        # So refuse the cases where the electrostatics cannot be located rather
+        # than guessing.
+
+        nonbondedForces = [f for f in system.getForces() if isinstance(f, openmm.NonbondedForce)]
+        if len(nonbondedForces) > 1:
+            # The MM charges handed to the model are read from a single
+            # NonbondedForce, so several of them are ambiguous.
+            raise ValueError("Multiple NonbondedForce objects encountered; electrostatic embedding requires exactly one.")
+
+        if any(isinstance(f, openmm.CustomNonbondedForce) for f in system.getForces()):
+            # A CustomNonbondedForce's energy expression is arbitrary, so
+            # whether it contains electrostatics cannot be determined here.
+            if customNonbondedHasCharges is None:
+                raise ValueError("The System contains a CustomNonbondedForce and it is unknown whether it includes electrostatic interactions; pass customNonbondedHasCharges to specify.")
+            if customNonbondedHasCharges and customNonbondedChargeParameter is None:
+                raise ValueError("A CustomNonbondedForce includes electrostatic interactions, so customNonbondedChargeParameter must name the per-particle parameter holding the charge.")
 
         # Create the new system with the ML-ML interactions that the model
         # computes removed.
@@ -506,6 +550,24 @@ class MACEPotentialImpl(MLPotentialImpl):
                 force.setExceptionsUsePeriodicBoundaryConditions(periodic)
 
             elif isinstance(force, openmm.CustomNonbondedForce):
+
+                # Zero the named charge parameter on the ML atoms, the same
+                # trick used for the NonbondedForce above.  Unlike there it is
+                # not guaranteed to work: it removes the ML terms only if the
+                # energy expression is multiplicatively separable in the charge,
+                # as q1*q2/r is, and that cannot be checked here.
+
+                if customNonbondedChargeParameter is not None:
+                    names = [force.getPerParticleParameterName(i)
+                             for i in range(force.getNumPerParticleParameters())]
+                    if customNonbondedChargeParameter not in names:
+                        raise ValueError(f"A CustomNonbondedForce has no per-particle parameter '{customNonbondedChargeParameter}'; it defines {names}.")
+                    chargeIndex = names.index(customNonbondedChargeParameter)
+                    for atom in atoms:
+                        parameters = list(force.getParticleParameters(atom))
+                        parameters[chargeIndex] = 0.0
+                        force.setParticleParameters(atom, parameters)
+
                 utilities.addCustomNonbondedExclusions(force, atoms)
 
         # Add the ML potential, telling it that it is responsible for the
@@ -514,7 +576,8 @@ class MACEPotentialImpl(MLPotentialImpl):
 
         self._preloadedModel = (model, device)
         try:
-            self.addForces(topology, newSystem, atoms, forceGroup, embedding=embedding, **args)
+            self.addForces(topology, newSystem, atoms, forceGroup, embedding=embedding,
+                       customNonbondedChargeParameter=customNonbondedChargeParameter, **args)
         finally:
             self._preloadedModel = None
 
@@ -554,7 +617,8 @@ def _should_use_mm_embedding(model, atoms: Optional[Iterable[int]], embedding: s
     return True
 
 
-def _prepareMMEmbedding(system: openmm.System, atoms: Optional[Iterable[int]]):
+def _prepareMMEmbedding(system: openmm.System, atoms: Optional[Iterable[int]],
+                        customNonbondedChargeParameter: Optional[str] = None):
     """Extract the MM complement and its charges from the system's NonbondedForce."""
     if atoms is None:
         return None
@@ -566,6 +630,32 @@ def _prepareMMEmbedding(system: openmm.System, atoms: Optional[Iterable[int]]):
         [i for i in range(num_particles) if i not in ml_set], dtype=np.int64
     )
 
+    # The charges given to the model have to come from wherever the force field
+    # actually keeps them, which is the same force createMixedSystem zeroed the
+    # ML charges in.  When that is a CustomNonbondedForce the caller has named
+    # the parameter holding them.
+    mm_charges = np.empty(len(mm_atoms), dtype=np.float64)
+
+    if customNonbondedChargeParameter is not None:
+        custom = None
+        for force in system.getForces():
+            if isinstance(force, openmm.CustomNonbondedForce):
+                names = [force.getPerParticleParameterName(i)
+                         for i in range(force.getNumPerParticleParameters())]
+                if customNonbondedChargeParameter in names:
+                    custom = force
+                    chargeIndex = names.index(customNonbondedChargeParameter)
+                    break
+        if custom is None:
+            raise ValueError(f"No CustomNonbondedForce defines a per-particle parameter '{customNonbondedChargeParameter}'.")
+        for row, atom_index in enumerate(mm_atoms):
+            mm_charges[row] = custom.getParticleParameters(int(atom_index))[chargeIndex]
+        return {
+            "ml_atoms": ml_atoms,
+            "mm_atoms": mm_atoms,
+            "mm_charges": mm_charges,
+        }
+
     nonbonded = None
     for force in system.getForces():
         if isinstance(force, openmm.NonbondedForce):
@@ -576,7 +666,6 @@ def _prepareMMEmbedding(system: openmm.System, atoms: Optional[Iterable[int]]):
             "PolarMACE MM embedding requires a NonbondedForce to source MM charges."
         )
 
-    mm_charges = np.empty(len(mm_atoms), dtype=np.float64)
     for row, atom_index in enumerate(mm_atoms):
         charge, _, _ = nonbonded.getParticleParameters(int(atom_index))
         mm_charges[row] = charge.value_in_unit(unit.elementary_charge)
@@ -667,6 +756,14 @@ def _computeMACE(state, model, ptr, node_attrs, batch, pbc, returnEnergyType, ch
     energy = float(results[returnEnergyType].detach())*energyScale
     forces = (results["forces"]*energyScale*lengthScale).detach().cpu().numpy()
     mm_forces = results.get("mm_forces")
+    if mmInfo is not None and mm_forces is None:
+        # The mixed system has had its ML-MM electrostatics removed on the
+        # understanding that this model supplies them.  A model that returns no
+        # forces on the MM atoms did not compute them, so continuing would leave
+        # those interactions missing entirely rather than merely approximated,
+        # and nothing downstream would report it.  The usual cause is a
+        # PolarMACE checkpoint whose forward does not accept mm_charges.
+        raise ValueError("The model returned no 'mm_forces' although MM charges were supplied; it does not implement electrostatic embedding.")
     if mm_forces is not None:
         mm_forces = (mm_forces * energyScale * lengthScale).detach().cpu().numpy()
 

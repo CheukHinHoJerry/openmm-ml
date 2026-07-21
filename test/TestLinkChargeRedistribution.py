@@ -175,3 +175,48 @@ def test_dz1_split_across_three_neighbors():
     for idx in (0, 2, 3):
         assert out[idx] == pytest.approx(-0.1)
     assert out.sum() == pytest.approx(mm_q.sum(), abs=1e-12)
+
+
+def test_dz1_with_two_bonded_M_atoms():
+    """Two M atoms bonded to each other must both end up at exactly zero.
+
+    Redistributing onto a neighbour that is itself an M atom hands it charge
+    that its own turn then discards, so the outcome depended on the order the
+    link records were listed in and left one M atom holding charge -- the very
+    charge DZ1 exists to move away from the ML region.
+    """
+    import numpy as np
+    import openmm.app as app
+    from openmm.app import element
+
+    topology = app.Topology()
+    chain = topology.addChain()
+    residue = topology.addResidue("X", chain)
+    atoms = [topology.addAtom(f"H{i}", element.hydrogen, residue) for i in range(6)]
+    # ML = {0, 1}; caps Q0->M2 and Q1->M3; M2 and M3 are bonded to each other.
+    for i, j in [(2, 3), (2, 4), (3, 5)]:
+        topology.addBond(atoms[i], atoms[j])
+
+    mm_atoms = np.array([2, 3, 4, 5])
+    mm_charges = np.array([-0.5, -0.3, 0.2, 0.1])
+
+    out = apply_link_charge_redistribution(
+        mm_atoms=mm_atoms,
+        mm_charges=mm_charges,
+        link_info={"q_global": np.array([0, 1]), "m_global": np.array([2, 3])},
+        topology=topology,
+        scheme="dz1",
+    )
+
+    assert out[0] == 0.0 and out[1] == 0.0
+    assert out.sum() == pytest.approx(mm_charges.sum(), abs=1e-12)
+
+    # And the answer must not depend on the order of the link records.
+    reversed_order = apply_link_charge_redistribution(
+        mm_atoms=mm_atoms,
+        mm_charges=mm_charges,
+        link_info={"q_global": np.array([1, 0]), "m_global": np.array([3, 2])},
+        topology=topology,
+        scheme="dz1",
+    )
+    np.testing.assert_allclose(out, reversed_order, atol=1e-12)

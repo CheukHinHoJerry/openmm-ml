@@ -283,19 +283,28 @@ def apply_link_charge_redistribution(
     # Filter: the neighbour must (a) be in mm_atoms, (b) not be a Q atom.
     # The QM filter is redundant against (a) when q_global ⊂ atoms ⊂ mm complement,
     # but cheap and explicit.
+    # A neighbour that is itself an M atom is excluded: it is about to be zeroed
+    # too, so charge handed to it would simply be discarded. Without that filter
+    # the result depends on the order the link records happen to be listed in,
+    # and two M atoms bonded to each other leave one of them holding charge that
+    # DZ1 exists to remove.
     m_set = set(m_globals)
     mm_neighbors_of_M: dict[int, list[int]] = {m: [] for m in m_globals}
     for bond in topology.bonds():
         a = bond.atom1.index
         b = bond.atom2.index
-        if a in m_set and b in mm_idx_to_row and b not in qm_set:
+        if a in m_set and b in mm_idx_to_row and b not in qm_set and b not in m_set:
             mm_neighbors_of_M[a].append(b)
-        if b in m_set and a in mm_idx_to_row and a not in qm_set:
+        if b in m_set and a in mm_idx_to_row and a not in qm_set and a not in m_set:
             mm_neighbors_of_M[b].append(a)
 
+    # Zero every M atom before redistributing any charge, so a share can never
+    # be written to a row that a later iteration then clears.
     import warnings
     for m in m_globals:
         new_charges[mm_idx_to_row[m]] = 0.0
+
+    for m in m_globals:
         m1s = mm_neighbors_of_M[m]
         if not m1s:
             warnings.warn(

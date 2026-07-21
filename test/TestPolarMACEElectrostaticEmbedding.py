@@ -32,6 +32,17 @@ import torch
 torch.serialization.add_safe_globals([slice])
 
 mace = pytest.importorskip("mace", reason="mace is not installed")
+
+# Every test here drives electrostatic embedding, which needs a PolarMACE whose
+# forward actually accepts mm_charges. The released mace-torch PolarMACE does
+# not; mlmm supplies it by grafting at import. Without that graft the model
+# silently ignores the MM charges, which used to leave this whole file passing
+# against a model that computed no ML-MM electrostatics at all.
+pytest.importorskip(
+    "mlmm.extensions.polarmace",
+    reason="PolarMACE mm_charges support is not available in this environment",
+)
+
 from e3nn import o3  # noqa: E402
 
 from openmmml import MLPotential  # noqa: E402
@@ -597,22 +608,27 @@ def test_link_charge_scheme_dz1_spreads_the_m_charge_and_conserves(polar_mace_mo
 @pytest.mark.parametrize("scheme", ["none", "z1", "dz1"])
 def test_link_charge_scheme_fd_force_consistency(polar_mace_model_path, scheme):
     """For each scheme, the MACE-side forces must equal the negative gradient
-    of the MACE-side energy. Central finite difference on two QM atoms in f64.
+    of the MACE-side energy. Central finite difference in f64.
 
-    Tolerance is intentionally loose (10 kJ/mol/nm): this runs against a
-    synthetic *untrained* MACE checkpoint whose local PES curvature is
-    arbitrary, so the central-difference truncation term is much larger than
-    on a trained model. The threshold is sized to catch a real
-    non-conservation regression (the `returnEnergyType='interaction_energy'`
-    bug fixed in PR #16 reproducibly showed |dF| in the hundreds of
-    kJ/mol/nm) while tolerating that synthetic-model noise floor. Do not
-    tighten without re-running against a trained model first.
+    Atoms 2 (Q) and 3 (M) are included deliberately: the cap sits between them
+    and is repositioned from their coordinates every step, so they are the only
+    atoms whose forces exercise the cap chain rule in redistribute_cap_force.
+    Perturbing only the interior QM atoms would leave that untested.
+
+    The criterion is relative to the size of the force being checked, not an
+    absolute number of kJ/mol/nm. This runs against a synthetic *untrained*
+    checkpoint at an arbitrary geometry, where forces reach ~1e7 kJ/mol/nm on
+    the boundary atoms and only ~1e6 in the interior; a fixed absolute
+    threshold is meaninglessly loose for the former and tight for the latter.
+    The central-difference truncation error scales as delta^2 while a genuine
+    force/energy inconsistency does not shrink with delta at all, which is what
+    separates the two and what this bound is sized against.
     """
     potential = MLPotential("mace", modelPath=polar_mace_model_path)
     _, ctx = _build_capped_mixed(potential, scheme=scheme)
 
     pos0 = _capped_chain_positions().value_in_unit(unit.nanometer).copy()
-    delta = 5e-5  # nm  (= 5e-4 Å, near the FD valley minimum for synthetic models)
+    delta = 1e-5  # nm; the truncation term goes as delta^2
 
     ctx.setPositions(pos0 * unit.nanometer)
     e_ref = ctx.getState(getEnergy=True).getPotentialEnergy().value_in_unit(
@@ -621,7 +637,10 @@ def test_link_charge_scheme_fd_force_consistency(polar_mace_model_path, scheme):
         unit.kilojoules_per_mole / unit.nanometer)
 
     max_abs_err = 0.0
-    for ia in (0, 1):           # two QM atoms
+    # Atoms 2 (Q) and 3 (M) are the ones the cap is placed between, so they are
+    # the only ones whose forces exercise the cap chain rule. Perturbing just
+    # the interior QM atoms 0 and 1 would leave the redistribution untested.
+    for ia in (0, 1, 2, 3):
         for ax in range(3):
             saved = pos0[ia, ax]
             pos0[ia, ax] = saved + delta
@@ -636,7 +655,10 @@ def test_link_charge_scheme_fd_force_consistency(polar_mace_model_path, scheme):
             f_num = -(e_p - e_m) / (2.0 * delta)
             err = abs(f_num - f_ref[ia, ax])
             max_abs_err = max(max_abs_err, err)
-    assert max_abs_err < 10.0, (
+    forceScale = float(np.abs(f_ref).max())
+    max_rel_err = max_abs_err / forceScale
+    assert max_rel_err < 5e-5, (
         f"FD vs analytical force mismatch for scheme='{scheme}': "
-        f"max |dF| = {max_abs_err:.3e} kJ/mol/nm (expected < 10)"
+        f"max |dF| = {max_abs_err:.3e} kJ/mol/nm against a force scale of "
+        f"{forceScale:.3e}, i.e. relative {max_rel_err:.3e} (expected < 5e-5)"
     )

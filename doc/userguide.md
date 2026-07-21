@@ -410,8 +410,9 @@ atoms with dangling valences.  The MACE interface can cap each such bond with a 
 bond vector at every force evaluation and with its forces redistributed onto the two real atoms it sits between, so the
 capped system stays conservative.  Caps are requested with the `linkRecords` argument to `createMixedSystem()`, which
 takes a sequence of `(q, m, target_dist)` tuples — `q` is the ML-side atom index, `m` the MM-side atom index, and
-`target_dist` the desired cap distance from `q` in Ångströms — or the path to a CSV file with `q_idx`, `m_idx`, and
-`target_dist_ang` columns.
+`target_dist` the desired cap distance from `q` in Ångströms — or the path to a CSV file with `q_idx1`, `m_idx1`, and
+`target_dist_ang` columns.  Note that the tuples are 0-based, matching OpenMM's atom indices, while the CSV columns are
+1-based, hence their names.
 
 The MM partial charge on each MM-side boundary atom would otherwise sit about 1.5 Å from the nearest ML atom, through
 the cap, and over-polarise it.  The `linkChargeScheme` argument controls how that charge is handled, affecting only the
