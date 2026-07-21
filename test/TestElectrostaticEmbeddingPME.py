@@ -201,26 +201,40 @@ def test_lj_parameters_preserved_for_all_particles():
         assert e_new == pytest.approx(e_old, abs=1e-12)
 
 
-def test_ml_mm_exceptions_zero_charge_with_lb_lj():
-    """ML-MM pairs with no pre-existing exception get a chargeProd=0 exception
-    using Lorentz-Berthelot LJ (so ML-MM LJ survives in direct-space)."""
+def test_ml_mm_pairs_get_no_exception():
+    """ML-MM pairs must be left on the ordinary pair list.
+
+    ML-MM Coulomb is removed by zeroing the ML particle charges, not by adding
+    an exception per ML-MM pair.  An exception would also be wrong: OpenMM
+    evaluates exceptions at the plain Cartesian distance rather than the
+    minimum image one, so under PBC the ML-MM Lennard-Jones interaction would
+    silently disappear for any pair that is only within the cutoff across a
+    periodic boundary.
+    """
     mixed, _ = _make_mixed_system(with_pre_existing_exception=False)
     nb = _get_nonbonded(mixed)
     excs = _all_exceptions(nb)
     for ml in _ML_ATOMS:
         for mm in _MM_ATOMS:
             key = tuple(sorted((ml, mm)))
-            assert key in excs, f"Missing ML-MM exception for {key}"
-            cp, sigma, epsilon = excs[key]
-            assert cp == pytest.approx(0.0, abs=1e-15)
-            ml_sigma = _PARAMS[ml][2]
-            ml_eps = _PARAMS[ml][3]
-            mm_sigma = _PARAMS[mm][2]
-            mm_eps = _PARAMS[mm][3]
-            expected_sigma = 0.5 * (ml_sigma + mm_sigma)
-            expected_eps = (ml_eps * mm_eps) ** 0.5
-            assert sigma == pytest.approx(expected_sigma, rel=1e-10)
-            assert epsilon == pytest.approx(expected_eps, rel=1e-10)
+            assert key not in excs, f"Unexpected ML-MM exception for {key}"
+
+
+def test_ml_charges_zeroed_and_lj_untouched():
+    """The Coulomb removal is done by zeroing the ML particle charges, which
+    leaves their Lennard-Jones parameters, and so ML-MM LJ, intact."""
+    mixed, _ = _make_mixed_system(with_pre_existing_exception=False)
+    nb = _get_nonbonded(mixed)
+    for ml in _ML_ATOMS:
+        charge, sigma, epsilon = _read_particle(nb, ml)
+        assert charge == pytest.approx(0.0, abs=1e-15)
+        assert sigma == pytest.approx(_PARAMS[ml][2], rel=1e-12)
+        assert epsilon == pytest.approx(_PARAMS[ml][3], rel=1e-12)
+    for mm in _MM_ATOMS:
+        charge, sigma, epsilon = _read_particle(nb, mm)
+        assert charge == pytest.approx(_PARAMS[mm][1], rel=1e-12)
+        assert sigma == pytest.approx(_PARAMS[mm][2], rel=1e-12)
+        assert epsilon == pytest.approx(_PARAMS[mm][3], rel=1e-12)
 
 
 def test_ml_mm_pre_existing_exception_keeps_lj_zeroes_charge():

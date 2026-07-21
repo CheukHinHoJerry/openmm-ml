@@ -35,6 +35,7 @@ mace = pytest.importorskip("mace", reason="mace is not installed")
 from e3nn import o3  # noqa: E402
 
 from openmmml import MLPotential  # noqa: E402
+from openmmml.models import macepotential  # noqa: E402
 from mace.modules import interaction_classes  # noqa: E402
 from mace.modules.extensions import PolarMACE  # noqa: E402
 
@@ -534,36 +535,63 @@ def _build_capped_mixed(potential, scheme):
 from openmm.app import element as elem  # noqa: E402  (kept near point of use)
 
 
-def test_link_charge_scheme_z1_changes_energy_vs_none(polar_mace_model_path):
-    """linkChargeScheme='z1' zeros the M-atom partial charge before it
-    reaches MACE. Versus 'none' (M keeps its full ff charge) the ML-MM
-    Coulomb term changes, so the total ML energy must change too."""
-    potential = MLPotential("mace", modelPath=polar_mace_model_path)
-    _, ctx_none = _build_capped_mixed(potential, scheme="none")
-    e_none, f_none = _energy_and_forces(ctx_none)
-    _, ctx_z1   = _build_capped_mixed(potential, scheme="z1")
-    e_z1, f_z1 = _energy_and_forces(ctx_z1)
-    assert np.isfinite(e_none) and np.isfinite(e_z1)
-    # Must differ by more than f64 round-off but well within ML-energy scale.
-    assert abs(e_z1 - e_none) > 1e-3, (
-        f"linkChargeScheme='z1' should differ from 'none' (got Δ={e_z1-e_none:.3e})"
-    )
-    assert np.linalg.norm(f_z1[:3] - f_none[:3]) > 1e-3
+def _mmChargesReachingModel(potential, scheme):
+    """The mm_charges array that createMixedSystem bakes into the ML force.
+
+    Asserting on the array rather than on the energy it produces is deliberate.
+    The energy route would only distinguish the schemes if the model in use
+    responded to the MM charge *values*, and the synthetic checkpoint built by
+    the polar_mace_model_path fixture does not for this fixture's geometry: its
+    energy is bit-identical whether mm_charges are passed unchanged, zeroed, or
+    scaled tenfold.  What the redistribution schemes are responsible for is the
+    contents of that array, so that is what these tests pin, exactly rather
+    than as an inequality.
+    """
+    captured = {}
+    original = macepotential._computeMACE
+
+    def capture(state, **args):
+        if args.get("mmInfo") is not None and "mm_charges" not in captured:
+            captured["mm_atoms"] = np.asarray(args["mmInfo"]["mm_atoms"])
+            captured["mm_charges"] = np.asarray(args["mmInfo"]["mm_charges"])
+        return original(state, **args)
+
+    macepotential._computeMACE = capture
+    try:
+        _, context = _build_capped_mixed(potential, scheme=scheme)
+        context.getState(getEnergy=True)
+    finally:
+        macepotential._computeMACE = original
+    assert "mm_charges" in captured, "the ML force never received MM charges"
+    return captured["mm_atoms"], captured["mm_charges"]
 
 
-def test_link_charge_scheme_dz1_differs_from_z1(polar_mace_model_path):
-    """DZ1 zeros the M atom AND adds q_M_orig/N to each MM neighbour. With
-    different MM-charge spatial distribution the ML region's MACE input
-    differs from Z1, so the ML energy/forces must differ too."""
+def test_link_charge_scheme_none_passes_forcefield_charges(polar_mace_model_path):
+    """With scheme='none' the model sees the MM force field charges verbatim."""
     potential = MLPotential("mace", modelPath=polar_mace_model_path)
-    _, ctx_z1  = _build_capped_mixed(potential, scheme="z1")
-    e_z1, _   = _energy_and_forces(ctx_z1)
-    _, ctx_dz = _build_capped_mixed(potential, scheme="dz1")
-    e_dz, _  = _energy_and_forces(ctx_dz)
-    assert abs(e_dz - e_z1) > 1e-4, (
-        f"DZ1 should differ from Z1 (M1 atoms saw redistributed charge); "
-        f"got Δ={e_dz-e_z1:.3e}"
-    )
+    mmAtoms, mmCharges = _mmChargesReachingModel(potential, "none")
+    # Atoms 3 (the M atom), 4 and 5 (its MM neighbours) from
+    # _build_capped_nonpbc_chain.
+    np.testing.assert_array_equal(mmAtoms, [3, 4, 5])
+    np.testing.assert_allclose(mmCharges, [-0.40, 0.15, 0.25], atol=1e-12)
+
+
+def test_link_charge_scheme_z1_zeros_the_m_atom(polar_mace_model_path):
+    """Z1 zeros the M-atom charge and leaves every other MM charge alone,
+    which changes the total MM charge by -q_M."""
+    potential = MLPotential("mace", modelPath=polar_mace_model_path)
+    _, mmCharges = _mmChargesReachingModel(potential, "z1")
+    np.testing.assert_allclose(mmCharges, [0.0, 0.15, 0.25], atol=1e-12)
+    assert mmCharges.sum() == pytest.approx(0.40, abs=1e-12)
+
+
+def test_link_charge_scheme_dz1_spreads_the_m_charge_and_conserves(polar_mace_model_path):
+    """DZ1 zeros the M-atom charge and spreads it over M's two MM neighbours,
+    -0.40/2 = -0.20 each, leaving the total MM charge unchanged."""
+    potential = MLPotential("mace", modelPath=polar_mace_model_path)
+    _, mmCharges = _mmChargesReachingModel(potential, "dz1")
+    np.testing.assert_allclose(mmCharges, [0.0, 0.15 - 0.20, 0.25 - 0.20], atol=1e-12)
+    assert mmCharges.sum() == pytest.approx(0.0, abs=1e-12)
 
 
 @pytest.mark.parametrize("scheme", ["none", "z1", "dz1"])

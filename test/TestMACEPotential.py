@@ -151,10 +151,20 @@ def testComputeMACEScattersMMForces():
 def testShouldUseMMEmbedding():
     assert _should_use_mm_embedding(PolarMACE(), [0, 1], "electrostatic")
     assert not _should_use_mm_embedding(PolarMACE(), [0, 1], "mechanical")
-    assert not _should_use_mm_embedding(PolarMACE(), None, "electrostatic")
-    assert not _should_use_mm_embedding(MACE(), [0, 1], "electrostatic")
+    assert not _should_use_mm_embedding(MACE(), [0, 1], "mechanical")
     with pytest.raises(ValueError, match="Unsupported embedding mode"):
         _should_use_mm_embedding(PolarMACE(), [0, 1], "bad-mode")
+
+
+def testElectrostaticEmbeddingRejectsUnsupportedCases():
+    """Electrostatic embedding must fail loudly rather than falling back to
+    mechanical embedding: by the time the potential is asked to add its forces,
+    the ML-MM electrostatics have already been removed from the MM force field,
+    so a silent fallback would simply lose them."""
+    with pytest.raises(ValueError, match="requires a model that accepts MM charges"):
+        _should_use_mm_embedding(MACE(), [0, 1], "electrostatic")
+    with pytest.raises(ValueError, match="requires an ML subset"):
+        _should_use_mm_embedding(PolarMACE(), None, "electrostatic")
 
 @pytest.mark.parametrize("platform_int", list(platform_ints))
 class TestMACE:
