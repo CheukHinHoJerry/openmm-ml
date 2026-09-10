@@ -394,7 +394,7 @@ class MACEPotentialImpl(MLPotentialImpl):
         assert returnEnergyType in ["interaction_energy", "energy"], f"Unsupported returnEnergyType: '{returnEnergyType}'. Supported options are 'interaction_energy' or 'energy'."
 
         model, device = self._loadModel(args)
-        if model.__class__.__name__ == "PolarMACE":
+        if model.__class__.__name__ in ("PolarMACE", "PolarMACEExternalSources"):
             returnEnergyType = "energy"
 
         use_mm_embedding = _should_use_mm_embedding(model, atoms, embedding)
@@ -504,6 +504,14 @@ class MACEPotentialImpl(MLPotentialImpl):
             # The MM charges handed to the model are read from a single
             # NonbondedForce, so several of them are ambiguous.
             raise ValueError("Multiple NonbondedForce objects encountered; electrostatic embedding requires exactly one.")
+
+        for force in nonbondedForces:
+            for index in range(force.getNumParticleParameterOffsets()):
+                if force.getParticleParameterOffset(index)[2] != 0:
+                    raise ValueError("Electrostatic embedding does not support charge parameter offsets.")
+            for index in range(force.getNumExceptionParameterOffsets()):
+                if force.getExceptionParameterOffset(index)[2] != 0:
+                    raise ValueError("Electrostatic embedding does not support charge parameter offsets.")
 
         if any(isinstance(f, openmm.CustomNonbondedForce) for f in system.getForces()):
             # A CustomNonbondedForce's energy expression is arbitrary, so

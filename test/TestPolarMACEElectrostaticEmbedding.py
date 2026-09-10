@@ -272,6 +272,24 @@ def test_polar_mace_pbc_runs_and_is_finite(polar_mace_model_path):
     assert np.all(np.isfinite(f))
 
 
+@pytest.mark.parametrize("periodic", [False, True])
+def test_polar_mace_default_returns_total_energy(polar_mace_model_path, periodic):
+    topology, system = _build_topology_and_system(num_mm_waters=2, periodic=periodic)
+    results = []
+    for options in ({}, {"returnEnergyType": "energy"}):
+        potential = MLPotential("mace", modelPath=polar_mace_model_path)
+        mixed = potential.createMixedSystem(
+            topology, system, [0, 1, 2], embedding="electrostatic", **options
+        )
+        context = openmm.Context(mixed, openmm.VerletIntegrator(0.001),
+                                 openmm.Platform.getPlatformByName("Reference"))
+        context.setPositions(_initial_positions(num_mm_waters=2))
+        results.append(_energy_and_forces(context))
+        del context
+    np.testing.assert_allclose(results[0][0], results[1][0], rtol=0, atol=1e-9)
+    np.testing.assert_allclose(results[0][1], results[1][1], rtol=0, atol=1e-8)
+
+
 def test_polar_mace_pbc_translation_invariance(polar_mace_model_path):
     """Energy and forces must be invariant under whole-system translation by
     one full box vector — the fundamental PBC sanity check."""

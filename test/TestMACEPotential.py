@@ -50,6 +50,23 @@ def testPrepareMMEmbedding():
     np.testing.assert_allclose(info["mm_charges"], [0.25], atol=1e-12)
 
 
+@pytest.mark.parametrize("kind", ["ml_particle", "mm_particle", "exception"])
+def testElectrostaticRejectsChargeOffsets(monkeypatch, kind):
+    system, force = _simple_nonbonded_system()
+    force.addGlobalParameter("lambda", 1.0)
+    if kind == "exception":
+        index = force.addException(0, 2, 0.25, 0.3, 0.0)
+        force.addExceptionParameterOffset("lambda", index, 0.5, 0.0, 0.0)
+    else:
+        force.addParticleParameterOffset("lambda", 0 if kind == "ml_particle" else 2, 0.5, 0.0, 0.0)
+    before = mm.XmlSerializer.serialize(system)
+    impl = MACEPotentialImpl("mace", None)
+    monkeypatch.setattr(impl, "_loadModel", lambda args: (PolarMACE(), "cpu"))
+    with pytest.raises(ValueError, match="charge parameter offsets"):
+        impl.createMixedSystem(app.Topology(), system, [0], 0, False, "electrostatic")
+    assert mm.XmlSerializer.serialize(system) == before
+
+
 class _FakeState:
     def __init__(self, positions_angstrom):
         self._positions = np.asarray(positions_angstrom, dtype=np.float64) * unit.angstrom
