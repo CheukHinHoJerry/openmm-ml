@@ -104,8 +104,7 @@ When using MACE models, the following extra keyword arguments to `createSystem()
 | Argument | Description |
 | --- | --- |
 | `precision` | The numerical precision of the model. Supported options are `'single'` and `'double'`.  If `None`, the default precision of the model is used. |
-| `returnEnergyType` | Whether to return the interaction energy or the energy including the self-energy.  The default is `'energy'`, which is the scalar the reported forces are the gradient of, so the potential is conservative.  Supported options are `'interaction_energy'` and `'energy'`. |
-| `embedding` | Passed by the embedding method rather than by you; see *Embeddings* below. |
+| `returnEnergyType` | Whether to return the interaction energy or the energy including the self-energy.  The default is `'interaction_energy'`. Supported options are `'interaction_energy'` and `'energy'`. |
 | `device` | The PyTorch device to perform calculations on, either a `torch.device` object or a string (such as `'cuda'` or `'cpu'`.)  If omitted, a device is chosen automatically. |
 | `charge` | The total charge of the system.  If omitted, it is assumed to be 0.  This is only used by MACE-OMOL-0.  For other models it is ignored. |
 | `multiplicity` | The spin multiplicity of the system.  If omitted, it is assumed to be 1.  This is only used by MACE-OMOL-0.  For other models it is ignored.  |
@@ -382,37 +381,7 @@ to specify which behavior your model uses when doing mechanical embedding in a p
 will be raised to inform you if this information is needed and not provided; OpenMM-ML will not assume either choice
 automatically.
 
-### Electrostatic Embedding
-
-This is a potential-specific embedding method provided by the MACE interface rather than a generic one, and it is
-selected with the embedding name `electrostatic`.  The MLIP, rather than the MM force field, computes the electrostatic
-interactions between the ML and MM atoms: it is given the positions and MM force field charges of the MM atoms, and
-returns forces on them alongside the forces on the ML atoms.  The ML subset can therefore polarise in response to its
-surroundings, which mechanical embedding does not allow.  Lennard-Jones interactions between the ML and MM atoms are
-still computed by the MM force field, as are all bonded terms that cross the ML/MM boundary.
-
-This is implemented by setting the MM force field charge of every ML atom to zero, so that every Coulomb term involving
-an ML atom vanishes, including the reciprocal space part of PME.  As a result, the MM force field's own charges are
-untouched and MM-MM electrostatics are unchanged.
-
-Only PolarMACE models can be used with this embedding method.  This includes the pretrained
-`mace-polar-1-small`, `mace-polar-1-medium`, and `mace-polar-1-large` models, as well as a PolarMACE checkpoint loaded
-with the model name `mace` and a `modelPath`.  For a custom checkpoint the method is listed because its type cannot be
-known until it is loaded; a non-PolarMACE checkpoint is rejected at that point rather than silently falling back to
-mechanical embedding, since the mixed system has already had its ML-MM electrostatics removed.
-
-The damped real-space and reciprocal-space ML-MM cross energy, including slab and molecule-in-box corrections, and the
-external-source feature and energy wrappers are implemented in `graph_longrange`. OpenMM-ML only supplies the external
-positions and charges to those blocks, then returns the corresponding MM forces. The normalization is therefore
-inherited from the checkpoint's own GTO density and feature bases rather than duplicated in the OpenMM interface.
-Interpolation is not supported, because at `lambda_interpolate=0` the ML-MM electrostatics would be missing from the MM
-endpoint.
-
-```python
-system = potential.createMixedSystem(topology, mm_system, ml_atoms, embedding='electrostatic')
-```
-
-### Molecules Spanning the ML-MM Region
+#### Molecules Spanning the ML-MM Region
 
 OpenMM-ML's mechanical embedding implementation supports the link-atom method for molecules having bonds crossing the
 boundary between the ML and MM regions.  If a molecule in the `Topology` provided contains bonds spanning the regions,
