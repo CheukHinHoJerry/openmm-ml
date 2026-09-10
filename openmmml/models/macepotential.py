@@ -37,63 +37,6 @@ from functools import partial
 import numpy as np
 
 
-def _floating_reference(module):
-    for tensor in module.buffers():
-        if tensor.is_floating_point():
-            return tensor
-    for tensor in module.parameters():
-        if tensor.is_floating_point():
-            return tensor
-    return None
-
-
-def _rebuild_feature_block(block, pbc_handling: str = "auto"):
-    """Rebuild a deterministic graph block saved by an older graph release."""
-    from graph_longrange.features import GTOElectrostaticFeatures
-
-    realspace = block.realspace_features
-    quadrupoles = bool(
-        getattr(
-            getattr(block.non_periodic_correction_terms, "self_field", None),
-            "include_quadrupole_corrections",
-            False,
-        )
-    )
-    rebuilt = GTOElectrostaticFeatures(
-        density_max_l=int(realspace.density_max_l),
-        density_smearing_width=float(realspace.density_smearing_width),
-        feature_max_l=int(realspace.projection_max_l),
-        feature_smearing_widths=[
-            float(x) for x in realspace.projection_smearing_widths
-        ],
-        include_self_interaction=bool(block.include_self_interaction),
-        kspace_cutoff=float(block.kspace_cutoff),
-        quadrupole_feature_corrections=quadrupoles,
-        integral_normalization=str(block.feature_basis.normalize),
-        pbc_handling=pbc_handling,
-    )
-    reference = _floating_reference(block)
-    if reference is not None:
-        rebuilt = rebuilt.to(device=reference.device, dtype=reference.dtype)
-    return rebuilt
-
-
-def _rebuild_energy_block(block, pbc_handling: str = "auto"):
-    from graph_longrange.energy import GTOElectrostaticEnergy
-
-    rebuilt = GTOElectrostaticEnergy(
-        density_max_l=int(block.density_max_l),
-        density_smearing_width=float(block.density_smearing_width),
-        kspace_cutoff=float(block.kspace_cutoff),
-        include_self_interaction=bool(block.include_self_interaction),
-        pbc_handling=pbc_handling,
-    )
-    reference = _floating_reference(block)
-    if reference is not None:
-        rebuilt = rebuilt.to(device=reference.device, dtype=reference.dtype)
-    return rebuilt
-
-
 def _prepare_external_sources(model, data, compute_force: bool):
     import torch
 
@@ -169,18 +112,16 @@ def _enable_polarmace_external_sources(model):
             "release that provides the external-source energy and feature blocks."
         ) from exc
 
-    feature_base = _rebuild_feature_block(model.electric_potential_descriptor)
-    energy_base = _rebuild_energy_block(model.coulomb_energy)
     model.electric_potential_descriptor = (
         GTOElectrostaticExternalSourceFeatures.from_features(
-            feature_base,
+            model.electric_potential_descriptor,
             # PolarMACE has two spin channels. Each receives half of the
             # physical external potential.
             external_scale=0.5,
         )
     )
     model.coulomb_energy = GTOElectrostaticExternalSourceEnergy.from_energy(
-        energy_base
+        model.coulomb_energy
     )
 
     class PolarMACEExternalSources(torch.nn.Module):
