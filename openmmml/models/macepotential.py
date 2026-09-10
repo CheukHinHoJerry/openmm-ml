@@ -42,28 +42,19 @@ def _prepare_external_sources(model, data, compute_force: bool):
 
     positions = data.get("mm_positions")
     charges = data.get("mm_charges")
-    if (
-        positions is None
-        or charges is None
-        or positions.numel() == 0
-        or charges.numel() == 0
-    ):
+    if positions is None or charges is None:
         return None
 
     ml_positions = data["positions"]
-    positions = positions.to(device=ml_positions.device, dtype=ml_positions.dtype)
-    positions = positions.clone().requires_grad_(compute_force)
+    positions = positions.to(ml_positions).clone().requires_grad_(compute_force)
+    charges = charges.to(ml_positions).reshape(-1)
+    if positions.shape[0] != charges.shape[0]:
+        raise ValueError("MM positions and charges must have the same length.")
+
     width = (int(model.atomic_multipoles_max_l) + 1) ** 2
-    features = torch.zeros(
-        (charges.numel(), width),
-        dtype=ml_positions.dtype,
-        device=ml_positions.device,
-    )
-    features[:, 0] = charges.to(features).reshape(-1)
-    if positions.shape[0] != features.shape[0]:
-        raise ValueError(
-            "MM positions and electrostatic sources must have the same length."
-        )
+    features = torch.zeros((len(charges), width), device=ml_positions.device,
+                           dtype=ml_positions.dtype)
+    features[:, 0] = charges
 
     transform = getattr(model, "_charges_to_mul_ir", None)
     if transform is not None:
@@ -71,19 +62,15 @@ def _prepare_external_sources(model, data, compute_force: bool):
 
     batch = data.get("mm_source_batch")
     if batch is None:
-        if int(data["pbc"].reshape(-1, 3).shape[0]) != 1:
+        if data["pbc"].reshape(-1, 3).shape[0] != 1:
             raise ValueError(
                 "mm_source_batch is required for batched PolarMACE inputs."
             )
-        batch = torch.zeros(
-            positions.shape[0], dtype=torch.long, device=positions.device
-        )
+        batch = torch.zeros(len(positions), dtype=torch.long, device=positions.device)
     else:
         batch = batch.to(device=positions.device, dtype=torch.long).reshape(-1)
-    if batch.shape[0] != positions.shape[0]:
-        raise ValueError(
-            "mm_source_batch and mm_positions must have the same length."
-        )
+        if batch.shape[0] != positions.shape[0]:
+            raise ValueError("mm_source_batch and mm_positions must have the same length.")
     return {"positions": positions, "features": features, "batch": batch}
 
 
@@ -734,17 +721,13 @@ def _computeMACE(state, model, ptr, node_attrs, batch, pbc, returnEnergyType, ch
         inputDict["mm_source_batch"] = torch.zeros(
             len(mmInfo["mm_atoms"]), dtype=torch.long, device=ptr.device
         )
+    # eval and get results
     results = model(inputDict, compute_force=True)
     energy = float(results[returnEnergyType].detach())*energyScale
     forces = (results["forces"]*energyScale*lengthScale).detach().cpu().numpy()
     mm_forces = results.get("mm_forces")
+
     if mmInfo is not None and mm_forces is None:
-        # The mixed system has had its ML-MM electrostatics removed on the
-        # understanding that this model supplies them.  A model that returns no
-        # forces on the MM atoms did not compute them, so continuing would leave
-        # those interactions missing entirely rather than merely approximated,
-        # and nothing downstream would report it.  The usual cause is a
-        # PolarMACE checkpoint whose forward does not accept mm_charges.
         raise ValueError("The model returned no 'mm_forces' although MM charges were supplied; it does not implement electrostatic embedding.")
     if mm_forces is not None:
         mm_forces = (mm_forces * energyScale * lengthScale).detach().cpu().numpy()
