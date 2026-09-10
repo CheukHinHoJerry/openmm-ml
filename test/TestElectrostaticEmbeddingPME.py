@@ -42,6 +42,8 @@ class _NoopImpl(MACEPotentialImpl):
         # it looks for, so the surgery under test runs without the PolarMACE
         # stack being installed.
         class PolarMACE:
+            supports_external_electrostatics = True
+
             pass
 
         return PolarMACE(), "cpu"
