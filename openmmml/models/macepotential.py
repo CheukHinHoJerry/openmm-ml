@@ -343,14 +343,7 @@ class MACEPotentialImpl(MLPotentialImpl):
         self._preloadedModel = None
 
     def _loadModel(self, args):
-        """Load the MACE model, returning it along with the device it is on.
-
-        If createMixedSystem() has already loaded a model in order to inspect
-        it, that one is handed over here rather than the checkpoint being read a
-        second time.  The handover is consumed on use, so each call after that
-        loads afresh; holding the model indefinitely would mean a later call
-        with a different precision converting an already converted model.
-        """
+        """Load a MACE model and place it on the requested device."""
         import torch
         try:
             from mace.calculators.foundations_models import mace_off, mace_mp, mace_omol, mace_polar
@@ -363,24 +356,23 @@ class MACEPotentialImpl(MLPotentialImpl):
             return preloaded[0], device
 
         if self.name in MACEPotentialImpl.KNOWN_MODELS:
-            functions = {
+            loaders = {
                 'mace_off': mace_off,
                 'mace_mp': mace_mp,
                 'mace_omol': mace_omol,
                 'mace_polar': mace_polar,
             }
-            fnName, name, restrictiveLicense, _, _ = MACEPotentialImpl.KNOWN_MODELS[self.name]
-            model = functions[fnName](model=name, device=device, return_raw_model=True).to(device)
-            if restrictiveLicense is not None:
+            loader_name, model_name, restrictive_license, _, _ = self.KNOWN_MODELS[self.name]
+            model = loaders[loader_name](model=model_name, device=device, return_raw_model=True).to(device)
+            if restrictive_license is not None:
                 import logging
-                logging.warning(f'The model {self.name} is distributed under the restrictive {restrictiveLicense} license.  Commercial use is not permitted.')
+                logging.warning(f'The model {self.name} is distributed under the restrictive {restrictive_license} license. Commercial use is not permitted.')
         elif self.name == "mace":
-            if self.modelPath is not None:
-                model = torch.load(self.modelPath, map_location=device)
-                if hasattr(model, "to"):
-                    model = model.to(device)
-            else:
+            if self.modelPath is None:
                 raise ValueError("No modelPath provided for local MACE model.")
+            model = torch.load(self.modelPath, map_location=device)
+            if hasattr(model, "to"):
+                model = model.to(device)
         else:
             raise ValueError(f"Unsupported MACE model: {self.name}")
         if model.__class__.__name__ == "PolarMACE":
