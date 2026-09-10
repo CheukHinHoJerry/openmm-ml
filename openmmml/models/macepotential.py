@@ -388,17 +388,10 @@ class MACEPotentialImpl(MLPotentialImpl):
         import torch
         try:
             from mace.tools import utils, to_one_hot, atomic_numbers_to_indices
-            from mace.calculators.foundations_models import mace_off, mace_mp, mace_omol, mace_polar
         except ImportError as e:
             raise ImportError(f"Failed to import mace with error: {e}. Install mace with 'pip install mace-torch'.")
-        try:
-            from e3nn.util import jit
-        except ImportError as e:
-            raise ImportError(f"Failed to import e3nn with error: {e}. Install e3nn with 'pip install e3nn'.")
 
         assert returnEnergyType in ["interaction_energy", "energy"], f"Unsupported returnEnergyType: '{returnEnergyType}'. Supported options are 'interaction_energy' or 'energy'."
-
-        # Load the model.
 
         model, device = self._loadModel(args)
         if model.__class__.__name__ == "PolarMACE":
@@ -406,10 +399,10 @@ class MACEPotentialImpl(MLPotentialImpl):
 
         use_mm_embedding = _should_use_mm_embedding(model, atoms, embedding)
 
-        includedAtoms = list(topology.atoms())
+        included_atoms = list(topology.atoms())
         if atoms is not None:
-            includedAtoms = [includedAtoms[i] for i in atoms]
-        atomicNumbers = [atom.element.atomic_number for atom in includedAtoms]
+            included_atoms = [included_atoms[i] for i in atoms]
+        atomic_numbers = [atom.element.atomic_number for atom in included_atoms]
 
         modelDefaultDtype = next(model.parameters()).dtype
         if precision is None:
@@ -422,10 +415,6 @@ class MACEPotentialImpl(MLPotentialImpl):
             raise ValueError(f"Unsupported precision {precision} for the model. Supported values are 'single' and 'double'.")
         if dtype != modelDefaultDtype:
             print(f"Model dtype is {modelDefaultDtype} and requested dtype is {dtype}. The model will be converted to the requested dtype.")
-            # Actually do the conversion. The previous code only printed the
-            # warning and left the model untouched, which caused dtype
-            # mismatches inside e3nn's compiled TensorProduct submodules
-            # when inputs were passed at the requested dtype.
             model = model.to(dtype)
 
         model_device = device
@@ -436,18 +425,12 @@ class MACEPotentialImpl(MLPotentialImpl):
 
         zTable = utils.AtomicNumberTable([int(z) for z in model.atomic_numbers])
         nodeAttrs = to_one_hot(
-            torch.tensor(atomic_numbers_to_indices(atomicNumbers, z_table=zTable), dtype=torch.long, device=model_device).unsqueeze(-1),
+            torch.tensor(atomic_numbers_to_indices(atomic_numbers, z_table=zTable), dtype=torch.long, device=model_device).unsqueeze(-1),
             num_classes=len(zTable))
 
-        if atoms is None:
-            indices = None
-        else:
-            indices = np.array(atoms)
+        indices = None if atoms is None else np.array(atoms)
         mmInfo = None
         if use_mm_embedding:
-            # ML-MM Coulomb is removed by MLPotential.createMixedSystem when
-            # embedding='electrostatic'. We only need MM positions/charges for
-            # the PolarMACE input here.
             mmInfo = _prepareMMEmbedding(system, atoms, customNonbondedChargeParameter)
         periodic = (topology.getPeriodicBoxVectors() is not None) or system.usesPeriodicBoundaryConditions()
 
@@ -475,17 +458,8 @@ class MACEPotentialImpl(MLPotentialImpl):
         return None
 
     def getSupportedEmbeddings(self) -> list[str]:
-
-        # Electrostatic embedding requires a model that accepts the charges and
-        # positions of the atoms outside the ML subset, which of the pretrained
-        # models only the PolarMACE family does.  A custom checkpoint may be a
-        # PolarMACE model too, but that cannot be known without loading it, so
-        # the method is offered and createMixedSystem() rejects the checkpoint
-        # once loaded if it turns out not to be one.
-
         if self.name in MACEPotentialImpl.KNOWN_MODELS:
-            _, _, _, _, acceptsMMCharges = MACEPotentialImpl.KNOWN_MODELS[self.name]
-            return ["electrostatic"] if acceptsMMCharges else []
+            return ["electrostatic"] if self.KNOWN_MODELS[self.name][4] else []
         return ["electrostatic"]
 
     def createMixedSystem(self,
