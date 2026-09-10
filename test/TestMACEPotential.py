@@ -111,7 +111,6 @@ def testComputeMACEScattersMMForces():
         multiplicity=torch.tensor([1.0], dtype=torch.float32),
         indices=np.array([0, 1], dtype=np.int64),
         periodic=False,
-        linkInfo=None,
         mmInfo=mm_info,
     )
 
@@ -279,6 +278,5 @@ def testMissingMMForcesIsAnError():
             multiplicity=torch.tensor([1.0], dtype=torch.float32),
             indices=np.array([0, 1], dtype=np.int64),
             periodic=False,
-            linkInfo=None,
             mmInfo=mmInfo,
         )

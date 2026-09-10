@@ -28,18 +28,279 @@ DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR
 OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE
 USE OR OTHER DEALINGS IN THE SOFTWARE.
 """
-import os
 import openmm
 from openmm import unit
 from openmmml.mlpotential import MLPotential, MLPotentialImpl, MLPotentialImplFactory
 from openmmml.embeddings import utilities
-from typing import Iterable, Optional, Sequence, Tuple, Union
+from typing import Iterable, Optional
 from functools import partial
-from pathlib import Path
 import numpy as np
 
-LinkRecordTuple = Tuple[int, int, float]  # (q_global, m_global, target_dist)
-LinkRecordsArg = Union[str, "os.PathLike[str]", Sequence[LinkRecordTuple], None]
+
+def _floating_reference(module):
+    for tensor in module.buffers():
+        if tensor.is_floating_point():
+            return tensor
+    for tensor in module.parameters():
+        if tensor.is_floating_point():
+            return tensor
+    return None
+
+
+def _rebuild_feature_block(block, pbc_handling: str = "auto"):
+    """Rebuild a deterministic graph block saved by an older graph release."""
+    from graph_longrange.features import GTOElectrostaticFeatures
+
+    realspace = block.realspace_features
+    quadrupoles = bool(
+        getattr(
+            getattr(block.non_periodic_correction_terms, "self_field", None),
+            "include_quadrupole_corrections",
+            False,
+        )
+    )
+    rebuilt = GTOElectrostaticFeatures(
+        density_max_l=int(realspace.density_max_l),
+        density_smearing_width=float(realspace.density_smearing_width),
+        feature_max_l=int(realspace.projection_max_l),
+        feature_smearing_widths=[
+            float(x) for x in realspace.projection_smearing_widths
+        ],
+        include_self_interaction=bool(block.include_self_interaction),
+        kspace_cutoff=float(block.kspace_cutoff),
+        quadrupole_feature_corrections=quadrupoles,
+        integral_normalization=str(block.feature_basis.normalize),
+        pbc_handling=pbc_handling,
+    )
+    reference = _floating_reference(block)
+    if reference is not None:
+        rebuilt = rebuilt.to(device=reference.device, dtype=reference.dtype)
+    return rebuilt
+
+
+def _rebuild_energy_block(block, pbc_handling: str = "auto"):
+    from graph_longrange.energy import GTOElectrostaticEnergy
+
+    rebuilt = GTOElectrostaticEnergy(
+        density_max_l=int(block.density_max_l),
+        density_smearing_width=float(block.density_smearing_width),
+        kspace_cutoff=float(block.kspace_cutoff),
+        include_self_interaction=bool(block.include_self_interaction),
+        pbc_handling=pbc_handling,
+    )
+    reference = _floating_reference(block)
+    if reference is not None:
+        rebuilt = rebuilt.to(device=reference.device, dtype=reference.dtype)
+    return rebuilt
+
+
+def _prepare_external_sources(model, data, compute_force: bool):
+    import torch
+
+    positions = data.get("mm_positions")
+    charges = data.get("mm_charges")
+    multipoles = data.get("mm_multipoles")
+    if charges is not None and multipoles is not None:
+        raise ValueError("mm_charges and mm_multipoles are mutually exclusive.")
+    values = multipoles if multipoles is not None else charges
+    if (
+        positions is None
+        or values is None
+        or positions.numel() == 0
+        or values.numel() == 0
+    ):
+        return None
+
+    ml_positions = data["positions"]
+    positions = positions.to(device=ml_positions.device, dtype=ml_positions.dtype)
+    positions = positions.clone().requires_grad_(compute_force)
+    width = (int(model.atomic_multipoles_max_l) + 1) ** 2
+    if multipoles is None:
+        features = torch.zeros(
+            (charges.numel(), width),
+            dtype=ml_positions.dtype,
+            device=ml_positions.device,
+        )
+        features[:, 0] = charges.to(features).reshape(-1)
+    else:
+        features = multipoles.to(
+            device=ml_positions.device, dtype=ml_positions.dtype
+        ).clone()
+        if features.dim() != 2 or features.shape != (positions.shape[0], width):
+            raise ValueError(f"mm_multipoles must have shape [N_mm, {width}].")
+        if width >= 4:
+            # Public Cartesian (q, px, py, pz) -> graph/e3nn (q, py, pz, px).
+            features[:, 1:4] = features[:, [2, 3, 1]]
+    if positions.shape[0] != features.shape[0]:
+        raise ValueError(
+            "MM positions and electrostatic sources must have the same length."
+        )
+
+    transform = getattr(model, "_charges_to_mul_ir", None)
+    if transform is not None:
+        features = transform(features)
+
+    batch = data.get("mm_source_batch")
+    if batch is None:
+        if int(data["pbc"].reshape(-1, 3).shape[0]) != 1:
+            raise ValueError(
+                "mm_source_batch is required for batched PolarMACE inputs."
+            )
+        batch = torch.zeros(
+            positions.shape[0], dtype=torch.long, device=positions.device
+        )
+    else:
+        batch = batch.to(device=positions.device, dtype=torch.long).reshape(-1)
+    if batch.shape[0] != positions.shape[0]:
+        raise ValueError(
+            "mm_source_batch and mm_positions must have the same length."
+        )
+    return {"positions": positions, "features": features, "batch": batch}
+
+
+def _enable_polarmace_external_sources(model):
+    """Wrap PolarMACE with dynamic MM electrostatic sources in eager mode."""
+    import torch
+
+    if getattr(model, "supports_external_electrostatics", False):
+        return model
+    if model.__class__.__name__ != "PolarMACE":
+        raise TypeError(
+            "External electrostatic sources require a PolarMACE model; got "
+            f"{model.__class__.__name__}."
+        )
+
+    try:
+        from graph_longrange.external_source_energy import (
+            GTOElectrostaticExternalSourceEnergy,
+        )
+        from graph_longrange.external_source_features import (
+            GTOElectrostaticExternalSourceFeatures,
+        )
+    except ImportError as exc:
+        raise ImportError(
+            "PolarMACE electrostatic embedding requires a graph_longrange "
+            "release that provides the external-source energy and feature blocks."
+        ) from exc
+
+    feature_base = _rebuild_feature_block(model.electric_potential_descriptor)
+    energy_base = _rebuild_energy_block(model.coulomb_energy)
+    model.electric_potential_descriptor = (
+        GTOElectrostaticExternalSourceFeatures.from_features(
+            feature_base,
+            # PolarMACE has two spin channels. Each receives half of the
+            # physical external potential.
+            external_scale=0.5,
+        )
+    )
+    model.coulomb_energy = GTOElectrostaticExternalSourceEnergy.from_energy(
+        energy_base
+    )
+
+    class PolarMACEExternalSources(torch.nn.Module):
+        supports_external_electrostatics = True
+
+        def __init__(self, wrapped):
+            super().__init__()
+            self.model = wrapped
+
+        def __getattr__(self, name):
+            try:
+                return super().__getattr__(name)
+            except AttributeError:
+                return getattr(self.model, name)
+
+        def forward(
+            self,
+            data,
+            training: bool = False,
+            compute_force: bool = True,
+            compute_virials: bool = False,
+            compute_stress: bool = False,
+            compute_displacement: bool = False,
+            compute_hessian: bool = False,
+            compute_edge_forces: bool = False,
+            compute_atomic_stresses: bool = False,
+            **kwargs,
+        ):
+            external = _prepare_external_sources(self.model, data, compute_force)
+            if external is None:
+                return self.model(
+                    data,
+                    training=training,
+                    compute_force=compute_force,
+                    compute_virials=compute_virials,
+                    compute_stress=compute_stress,
+                    compute_displacement=compute_displacement,
+                    compute_hessian=compute_hessian,
+                    compute_edge_forces=compute_edge_forces,
+                    compute_atomic_stresses=compute_atomic_stresses,
+                    **kwargs,
+                )
+            if any(
+                (
+                    compute_virials,
+                    compute_stress,
+                    compute_displacement,
+                    compute_hessian,
+                    compute_edge_forces,
+                    compute_atomic_stresses,
+                )
+            ):
+                raise NotImplementedError(
+                    "The OpenMM external-source adapter currently supports "
+                    "energies and Cartesian forces only."
+                )
+
+            external_kwargs = {
+                "external_feats": external["features"],
+                "external_positions": external["positions"],
+                "external_batch": external["batch"],
+            }
+            self.model.electric_potential_descriptor.set_external_sources(
+                **external_kwargs
+            )
+            self.model.coulomb_energy.set_external_sources(**external_kwargs)
+            try:
+                result = self.model(
+                    data,
+                    training=training,
+                    compute_force=False,
+                    compute_virials=False,
+                    compute_stress=False,
+                    compute_displacement=False,
+                    compute_hessian=False,
+                    compute_edge_forces=False,
+                    compute_atomic_stresses=False,
+                    **kwargs,
+                )
+                if compute_force:
+                    ml_gradient, mm_gradient = torch.autograd.grad(
+                        outputs=[result["energy"]],
+                        inputs=[data["positions"], external["positions"]],
+                        grad_outputs=[torch.ones_like(result["energy"])],
+                        create_graph=training,
+                        retain_graph=training,
+                        allow_unused=True,
+                    )
+                    result["forces"] = (
+                        torch.zeros_like(data["positions"])
+                        if ml_gradient is None
+                        else -ml_gradient
+                    )
+                    result["mm_forces"] = (
+                        torch.zeros_like(external["positions"])
+                        if mm_gradient is None
+                        else -mm_gradient
+                    )
+                else:
+                    result["mm_forces"] = None
+                return result
+            finally:
+                self.model.electric_potential_descriptor.clear_external_sources()
+                self.model.coulomb_energy.clear_external_sources()
+
+    return PolarMACEExternalSources(model)
 
 
 class MACEPotentialImplFactory(MLPotentialImplFactory):
@@ -196,11 +457,7 @@ class MACEPotentialImpl(MLPotentialImpl):
         else:
             raise ValueError(f"Unsupported MACE model: {self.name}")
         if model.__class__.__name__ == "PolarMACE":
-            from openmmml.models._polarmace_external import (
-                enable_polarmace_external_sources,
-            )
-
-            model = enable_polarmace_external_sources(model)
+            model = _enable_polarmace_external_sources(model)
         return model, device
 
     def addForces(
@@ -211,8 +468,6 @@ class MACEPotentialImpl(MLPotentialImpl):
         forceGroup: int,
         precision: Optional[str] = None,
         returnEnergyType: str = "energy",
-        linkRecords: LinkRecordsArg = None,
-        linkChargeScheme: str = "dz1",
         embedding: str = "mechanical",
         customNonbondedChargeParameter: Optional[str] = None,
         **args,
@@ -241,28 +496,6 @@ class MACEPotentialImpl(MLPotentialImpl):
             returns only the message-passing readout; for PolarMACE this is
             **not** the gradient partner of ``forces`` and will produce
             apparent NVE drift / a non-zero finite-difference plateau.
-        linkRecords : str / path / sequence of (q_global, m_global, target_dist) / None
-            Hydrogen link-atom cap records for QM/MM boundary bonds.
-        linkChargeScheme : str, optional
-            How to handle the partial charges on the MM-side boundary atoms
-            (M atoms) when ``linkRecords`` is provided. The M-atom partial
-            charge would otherwise sit ~1.5 Å from the nearest QM atom (through
-            the link H) and over-polarise the QM region's MACE-predicted
-            electronic structure. Supported in this iteration:
-
-            - ``"none"``: leave MM charges untouched (legacy behaviour).
-            - ``"z1"``: set q_M = 0 for every M atom. Cheapest fix; breaks
-              total MM-charge neutrality by -q_M_orig.
-            - ``"dz1"`` (default): q_M = 0 plus q_M_orig is distributed
-              equally onto M's MM neighbours (M1 atoms). Preserves total
-              MM charge to round-off. Falls back to Z1 (with a warning) for
-              any M atom that has zero MM neighbours.
-
-            Only modifies the MM charge array passed to the ML potential;
-            the OpenMM ``NonbondedForce`` is left untouched, so MM-MM Coulomb
-            is bit-exact with the original force field (standard QM/MM
-            practice). Z2 and RCD (which require per-step virtual charges)
-            are not in this iteration.
         embedding : {"mechanical", "electrostatic"}
             Which embedding method the caller is implementing. Set by
             ``createMixedSystem``; there is normally no reason to pass it here
@@ -314,10 +547,6 @@ class MACEPotentialImpl(MLPotentialImpl):
                     stacklevel=2,
                 )
 
-        linkInfo = _prepareLinkRecords(linkRecords, atoms, topology, system)
-        if linkInfo is not None:
-            atomicNumbers = atomicNumbers + [1] * linkInfo["K"]
-
         modelDefaultDtype = next(model.parameters()).dtype
         if precision is None:
             dtype = modelDefaultDtype
@@ -356,23 +585,6 @@ class MACEPotentialImpl(MLPotentialImpl):
             # embedding='electrostatic'. We only need MM positions/charges for
             # the PolarMACE input here.
             mmInfo = _prepareMMEmbedding(system, atoms, customNonbondedChargeParameter)
-
-            # Optional Z1 / DZ1 link-atom charge redistribution. Standard QM/MM
-            # correction to stop the QM region from being over-polarised by
-            # the partial charge on the MM-side boundary atom.
-            if linkInfo is not None and linkChargeScheme not in (None, "none"):
-                from openmmml.models._links import (
-                    apply_link_charge_redistribution as _apply_link_q,
-                )
-                mmInfo["mm_charges"] = _apply_link_q(
-                    mm_atoms=mmInfo["mm_atoms"],
-                    mm_charges=mmInfo["mm_charges"],
-                    link_info=linkInfo,
-                    topology=topology,
-                    scheme=linkChargeScheme,
-                )
-                print(f"[link-charge-redistribution] scheme={linkChargeScheme}  "
-                      f"M atoms touched={len(linkInfo['m_global'])}")
         periodic = (topology.getPeriodicBoxVectors() is not None) or system.usesPeriodicBoundaryConditions()
 
         compute = partial(_computeMACE,
@@ -386,7 +598,6 @@ class MACEPotentialImpl(MLPotentialImpl):
                           multiplicity=torch.tensor([float(args.get('multiplicity', 1))], dtype=dtype, device=model_device, requires_grad=False),
                           indices=indices,
                           periodic=periodic,
-                          linkInfo=linkInfo,
                           mmInfo=mmInfo)
         force = openmm.PythonForce(compute)
         force.setForceGroup(forceGroup)
@@ -687,7 +898,7 @@ def _prepareMMEmbedding(system: openmm.System, atoms: Optional[Iterable[int]],
     }
 
 
-def _computeMACE(state, model, ptr, node_attrs, batch, pbc, returnEnergyType, charge, multiplicity, indices, periodic, linkInfo=None, mmInfo=None):
+def _computeMACE(state, model, ptr, node_attrs, batch, pbc, returnEnergyType, charge, multiplicity, indices, periodic, mmInfo=None):
     import torch
     from mace.data.neighborhood import get_neighborhood
     energyScale = 96.4853
@@ -698,28 +909,6 @@ def _computeMACE(state, model, ptr, node_attrs, batch, pbc, returnEnergyType, ch
         positions = positions_full[indices]
     else:
         positions = positions_full
-
-    # Link atoms: append K fictitious H positions placed each step from current
-    # Q, M coordinates. These extend the model input only; they never enter the
-    # OpenMM system. See docs/plans/link-atom-inference.md.
-    if linkInfo is not None:
-        if indices is None:
-            raise ValueError("linkRecords requires an explicit `atoms` subset.")
-        from openmmml.models._links import compute_cap_positions, minimum_image_M
-        r_Q = positions_full[linkInfo["q_global"]]
-        r_M = positions_full[linkInfo["m_global"]]
-        if periodic:
-            # Minimum-image the Q->M bond so caps are placed correctly even if Q
-            # and M sit across a periodic boundary. The same imaged r_M is reused
-            # for force redistribution below, so the returned force stays the
-            # gradient of the reported energy. Triclinic-correct; raises on a
-            # genuinely wrapped pair (see minimum_image_M).
-            cell_A = state.getPeriodicBoxVectors(asNumpy=True).value_in_unit(unit.angstrom)
-            r_M = minimum_image_M(r_Q, r_M, cell_A)
-        pos_link, _C_L_unused = compute_cap_positions(
-            r_Q, r_M, linkInfo["target_dist"]
-        )
-        positions = np.concatenate([positions, pos_link], axis=0)
 
     if periodic:
         cell = state.getPeriodicBoxVectors(asNumpy=True).value_in_unit(unit.angstrom)
@@ -777,118 +966,11 @@ def _computeMACE(state, model, ptr, node_attrs, batch, pbc, returnEnergyType, ch
     if mm_forces is not None:
         mm_forces = (mm_forces * energyScale * lengthScale).detach().cpu().numpy()
 
-    # force redistribution and add mm_forces back to the full system
+    # Scatter ML and MM forces back to the full system.
     if indices is not None:
         f = np.zeros((numAtoms, 3), dtype=(np.float64 if dtype == torch.float64 else np.float32))
-        if linkInfo is None:
-            f[indices] = forces
-        else:
-            from openmmml.models._links import (
-                compute_cap_positions,
-                minimum_image_M,
-                redistribute_cap_force,
-            )
-            N = len(indices)
-            f_ml = forces[:N]
-            f_link = forces[N:]
-            f[indices] = f_ml
-
-            # Redistribute each link atom's force onto its (Q, M) partners.
-            r_Q = positions_full[linkInfo["q_global"]]
-            r_M = positions_full[linkInfo["m_global"]]
-            if periodic:
-                cell_A = state.getPeriodicBoxVectors(asNumpy=True).value_in_unit(unit.angstrom)
-                r_M = minimum_image_M(r_Q, r_M, cell_A)
-            _, C_L = compute_cap_positions(r_Q, r_M, linkInfo["target_dist"])
-            F_Q_add, F_M_add = redistribute_cap_force(f_link, r_Q, r_M, C_L)
-
-            f[linkInfo["q_global"]] += F_Q_add.astype(f.dtype, copy=False)
-            f[linkInfo["m_global"]] += F_M_add.astype(f.dtype, copy=False)
+        f[indices] = forces
         if mmInfo is not None and mm_forces is not None:
             f[mmInfo["mm_atoms"]] += mm_forces.astype(f.dtype, copy=False)
         forces = f
     return energy, forces
-
-
-def _prepareLinkRecords(linkRecords, atoms, topology, system):
-    """Normalize the ``linkRecords`` argument into a frozen bundle for the
-    per-step closure. Returns ``None`` if no link records were supplied.
-
-    Assertions (failing loudly):
-      * non-periodic system (PBC deferred to a follow-up PR)
-      * ``atoms`` is not None
-      * every ``q_global`` is in ``atoms``
-      * no ``m_global`` is in ``atoms``
-      * every (Q, M) pair is unique, and no atom appears as Q or M in more
-        than one cap (simplifies per-step scatter; relax later if needed)
-    """
-    if linkRecords is None:
-        return None
-
-    # Periodic systems are allowed: cap positions are placed with minimum-image
-    # at runtime (_computeMACE), which is exact as long as each link bond is
-    # shorter than half the box -- always true for real frontier bonds. A
-    # genuinely wrapped (Q, M) pair (longer than half the box) raises there.
-    if atoms is None:
-        raise ValueError("linkRecords requires an explicit `atoms` subset.")
-
-    if isinstance(linkRecords, (str, Path)):
-        # A capping-mapping CSV is 1-based: read (q_idx1, m_idx1,
-        # target_dist_ang) and convert to 0-based OpenMM indices. target_dist
-        # stays in Angstroms, canonical because it matches the MACE-side
-        # `positions_full`. Cap positions are not stored in the CSV; they are
-        # recomputed each step from (q, m, target_dist).
-        import csv as _csv
-        tuples = []
-        with open(linkRecords, newline="") as _f:
-            for row in _csv.DictReader(_f):
-                tuples.append(
-                    (int(row["q_idx1"]) - 1, int(row["m_idx1"]) - 1, float(row["target_dist_ang"]))
-                )
-    else:
-        # Tuple path: target_dist is also in Å (matches the docstring
-        # parameter name `target_dist_ang` and the MACE convention used
-        # in every upstream test fixture, e.g. linkRecords=[(q, m, 1.09)]).
-        tuples = [(int(q), int(m), float(td)) for (q, m, td) in linkRecords]
-
-    if not tuples:
-        return None
-
-    num_particles = int(system.getNumParticles())
-    atoms_set = set(int(a) for a in atoms)
-    seen_pairs: set = set()
-    seen_q: set = set()
-    seen_m: set = set()
-    q_global = np.empty(len(tuples), dtype=np.int64)
-    m_global = np.empty(len(tuples), dtype=np.int64)
-    target_dist = np.empty(len(tuples), dtype=np.float64)
-    for k, (q, m, td) in enumerate(tuples):
-        if not (0 <= q < num_particles):
-            raise ValueError(f"linkRecords[{k}]: q_global={q} out of range [0, {num_particles}).")
-        if not (0 <= m < num_particles):
-            raise ValueError(f"linkRecords[{k}]: m_global={m} out of range [0, {num_particles}).")
-        if q not in atoms_set:
-            raise ValueError(f"linkRecords[{k}]: q_global={q} is not in `atoms`.")
-        if m in atoms_set:
-            raise ValueError(f"linkRecords[{k}]: m_global={m} is in `atoms` (should be MM).")
-        if (q, m) in seen_pairs:
-            raise ValueError(f"linkRecords[{k}]: duplicate (Q, M) pair ({q}, {m}).")
-        if q in seen_q or m in seen_m:
-            raise ValueError(
-                f"linkRecords[{k}]: atom {q if q in seen_q else m} appears in more than "
-                "one cap; current implementation requires unique Q and M across caps."
-            )
-        if td <= 0:
-            raise ValueError(f"linkRecords[{k}]: target_dist must be positive; got {td}.")
-        seen_pairs.add((q, m))
-        seen_q.add(q)
-        seen_m.add(m)
-        q_global[k] = q
-        m_global[k] = m
-        target_dist[k] = td
-    return {
-        "K": len(tuples),
-        "q_global": q_global,
-        "m_global": m_global,
-        "target_dist": target_dist,
-    }
