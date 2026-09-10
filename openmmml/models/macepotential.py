@@ -707,23 +707,13 @@ def _supports_mm_embedding(model) -> bool:
     return bool(getattr(model, "supports_external_electrostatics", False))
 
 
-_SUPPORTED_EMBEDDINGS = ("mechanical", "electrostatic")
-_MM_EMBEDDING_MODES = ("electrostatic",)
-
-
 def _should_use_mm_embedding(model, atoms: Optional[Iterable[int]], embedding: str) -> bool:
-    if embedding not in _SUPPORTED_EMBEDDINGS:
-        raise ValueError(
-            f"Unsupported embedding mode '{embedding}'. Supported values are "
-            + ", ".join(repr(m) for m in _SUPPORTED_EMBEDDINGS)
-            + "."
-        )
-    if embedding not in _MM_EMBEDDING_MODES:
+    """Validate the only MACE-specific embedding: electrostatic."""
+    if embedding == "mechanical":
         return False
+    if embedding != "electrostatic":
+        raise ValueError(f"Unsupported embedding mode '{embedding}'.")
     if not _supports_mm_embedding(model):
-        # The mixed system has had its ML-MM Coulomb removed on the assumption
-        # that the model will supply it, so falling back to mechanical
-        # embedding here would silently discard those interactions.
         raise ValueError(
             f"embedding='{embedding}' requires a model that accepts MM charges "
             f"and positions (PolarMACE); got {model.__class__.__name__}."
