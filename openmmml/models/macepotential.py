@@ -269,17 +269,14 @@ class MACEPotentialImpl(MLPotentialImpl):
     According to the MACE documentation, 'single' precision is recommended for MD (faster but
     less accurate), while 'double' precision is recommended for geometry optimization.
 
-    By default the reported energy is the full ``energy`` returned by the MACE
-    model — the same scalar whose gradient w.r.t. positions is reported as the
-    force, so the resulting potential is exactly conservative. To get only the
-    message-passing readout component, set ``returnEnergyType='interaction_energy'``:
+    By default the reported energy is ``interaction_energy``. PolarMACE is an
+    exception: it automatically uses the full ``energy`` output because that is
+    the scalar whose gradient w.r.t. positions is reported as the force.
 
     >>> system = potential.createSystem(topology, returnEnergyType='interaction_energy')
 
-    Note: ``returnEnergyType='interaction_energy'`` is **not** energy/force
-    consistent for the PolarMACE family, which adds Coulomb / dipole / local-
-    electron terms to ``total_energy`` whose gradients are in ``forces`` but
-    which are not in ``interaction_energy``.
+    PolarMACE therefore uses ``energy`` automatically even when
+    ``returnEnergyType`` is left at its default.
 
     Precision caveat for ``returnEnergyType='energy'``: this key returns the
     full ``total_energy = e0 + inter_e + extras`` where ``e0`` are the
@@ -292,7 +289,7 @@ class MACEPotentialImpl(MLPotentialImpl):
     magnitude — meV resolution is lost. Use ``precision='double'`` if you
     need accurate absolute energies, or note that energy differences (e.g.
     NVE drift) still resolve cleanly because the e0 contribution cancels in
-    the difference. A runtime warning fires when this regime is detected.
+    the difference.
 
     Attributes
     ----------
@@ -386,7 +383,7 @@ class MACEPotentialImpl(MLPotentialImpl):
         atoms: Optional[Iterable[int]],
         forceGroup: int,
         precision: Optional[str] = None,
-        returnEnergyType: str = "energy",
+        returnEnergyType: str = "interaction_energy",
         embedding: str = "mechanical",
         customNonbondedChargeParameter: Optional[str] = None,
         **args,
@@ -409,12 +406,9 @@ class MACEPotentialImpl(MLPotentialImpl):
             If ``None``, the default precision of the model is used.
         returnEnergyType : str, optional
             Which scalar from the MACE model output is reported to OpenMM as
-            the potential energy. Default ``'energy'`` is the same quantity
-            the force vector is differentiated against, so OpenMM sees a
-            self-consistent (conservative) potential. ``'interaction_energy'``
-            returns only the message-passing readout; for PolarMACE this is
-            **not** the gradient partner of ``forces`` and will produce
-            apparent NVE drift / a non-zero finite-difference plateau.
+            the potential energy. The default is ``'interaction_energy'`` for
+            ordinary MACE and ``'energy'`` for PolarMACE, whose force gradient
+            includes additional electrostatic terms.
         embedding : {"mechanical", "electrostatic"}
             Which embedding method the caller is implementing. Set by
             ``createMixedSystem``; there is normally no reason to pass it here
@@ -441,6 +435,8 @@ class MACEPotentialImpl(MLPotentialImpl):
         # Load the model.
 
         model, device = self._loadModel(args)
+        if model.__class__.__name__ == "PolarMACE":
+            returnEnergyType = "energy"
 
         use_mm_embedding = _should_use_mm_embedding(model, atoms, embedding)
 
@@ -448,23 +444,6 @@ class MACEPotentialImpl(MLPotentialImpl):
         if atoms is not None:
             includedAtoms = [includedAtoms[i] for i in atoms]
         atomicNumbers = [atom.element.atomic_number for atom in includedAtoms]
-
-        if returnEnergyType == "energy":
-            try:
-                e0_max = float(model.atomic_energies_fn.atomic_energies.detach().abs().max())
-            except AttributeError:
-                e0_max = 0.0
-            if e0_max > 100.0:  # 1 eV per atom is conservative; foundation models far exceed this
-                import warnings as _w
-                _w.warn(
-                    f"returnEnergyType='energy' includes per-atom reference "
-                    f"energies (max |e0| = {e0_max:.2f} eV/atom over {int(model.atomic_energies_fn.atomic_energies.numel())} "
-                    f"element entries). Use precision='double' if you need accurate absolute "
-                    f"energies, or pass returnEnergyType='interaction_energy' for the "
-                    f"e0-subtracted readout (note: only 'energy' is gradient-consistent "
-                    f"with PolarMACE — see the docstring).",
-                    stacklevel=2,
-                )
 
         modelDefaultDtype = next(model.parameters()).dtype
         if precision is None:
