@@ -266,30 +266,14 @@ class MACEPotentialImpl(MLPotentialImpl):
     >>> system = potential.createSystem(topology, precision='single')
 
     By default, the implementation uses the precision of the loaded MACE model.
-    According to the MACE documentation, 'single' precision is recommended for MD (faster but
-    less accurate), while 'double' precision is recommended for geometry optimization.
+    Single precision is faster; double precision is more accurate.
 
     By default the reported energy is ``interaction_energy``. PolarMACE is an
     exception: it automatically uses the full ``energy`` output because that is
     the scalar whose gradient w.r.t. positions is reported as the force.
 
-    >>> system = potential.createSystem(topology, returnEnergyType='interaction_energy')
-
-    PolarMACE therefore uses ``energy`` automatically even when
-    ``returnEnergyType`` is left at its default.
-
-    Precision caveat for ``returnEnergyType='energy'``: this key returns the
-    full ``total_energy = e0 + inter_e + extras`` where ``e0`` are the
-    model's per-atom reference energies. For foundation models (mace-mp,
-    mace-off, mace-omat, ...) ``e0`` is typically tens of eV per atom, so the
-    reported scalar for a large ML region can be 10⁴–10⁶ eV in magnitude.
-    The **forces** stay exact at any scale (they are gradients of this same
-    scalar), but the **energy** column written into single-precision OpenMM
-    state files / log lines may carry only ~6–7 significant digits at that
-    magnitude — meV resolution is lost. Use ``precision='double'`` if you
-    need accurate absolute energies, or note that energy differences (e.g.
-    NVE drift) still resolve cleanly because the e0 contribution cancels in
-    the difference.
+    PolarMACE automatically uses ``energy`` so its electrostatic forces and
+    reported energy remain consistent.
 
     Attributes
     ----------
@@ -299,12 +283,7 @@ class MACEPotentialImpl(MLPotentialImpl):
         The path to the locally trained MACE model if ``name`` is 'mace'.
     """
 
-    # (Function name, model name, restrictive license name or None, long-range,
-    # accepts MM charges)
-    #
-    # The last flag records whether the model can be given the charges and
-    # positions of the atoms outside the ML subset, which is what electrostatic
-    # embedding requires.  Only the PolarMACE family can.
+    # (loader, model name, restrictive license, long-range, accepts MM charges)
     KNOWN_MODELS = {
         'mace-off23-small': ('mace_off', 'small', 'ASL', False, False),
         'mace-off23-medium': ('mace_off', 'medium', 'ASL', False, False),
@@ -534,65 +513,18 @@ class MACEPotentialImpl(MLPotentialImpl):
                           **args) -> openmm.System:
         """Create a mixed system using electrostatic embedding.
 
-        The model, rather than the conventional force field, is responsible for
-        the electrostatic interactions between the atoms within the ML subset
-        and those outside of it: it is passed the positions and conventional
-        force field charges of the atoms outside the ML subset, and returns
-        forces on them alongside the forces on the ML subset.  The ML subset can
-        therefore polarize in response to its surroundings, which mechanical
-        embedding does not allow.
-
-        This is implemented as the "global charge zero" variant: the
-        conventional force field charge of every atom in the ML subset is set to
-        zero.  Every Coulomb term involving an ML atom is then zero by
-        construction, including the reciprocal space part of PME, without any
-        per-pair exceptions being added.  Adding an exception for each ML-MM
-        pair would instead be incorrect under periodic boundary conditions,
-        since NonbondedForce evaluates exceptions using plain Cartesian
-        distances rather than the minimum image convention, so the ML-MM
-        Lennard-Jones interaction would silently vanish for any pair that is
-        only within the cutoff across a periodic boundary.  Lennard-Jones is
-        left to the conventional force field and continues to use the ordinary,
-        periodicity-aware pair list.
-
-        Interactions within the ML subset are excluded entirely, as the model
-        computes them.  Bonded terms that cross the ML/MM boundary are retained.
-
-        Only models that accept MM charges and positions, which at present means
-        the PolarMACE family, can be used with this embedding method.  An error
-        is raised for any other model rather than falling back to mechanical
-        embedding, since by that point the ML-MM electrostatics have already
-        been removed from the conventional force field and a fallback would
-        simply lose them.
-
-        Because this method has to account for every Coulomb term in the force
-        field, it requires the System to contain exactly one NonbondedForce: the
-        MM charges given to the model are read from one, so several would be
-        ambiguous.
-
-        It also needs to be told about any CustomNonbondedForce, whose energy
-        expression is arbitrary and cannot be inspected here.  Pass
-        customNonbondedHasCharges=False to declare that it holds no
-        electrostatics, or True together with customNonbondedChargeParameter
-        naming the per-particle parameter that holds the charge, which is then
-        zeroed on the ML atoms exactly as for the NonbondedForce.  An error is
-        raised if the answer is needed and has not been given.
-
-        Note that zeroing that parameter removes the ML terms only if the
-        expression is multiplicatively separable in the charge, as the usual
-        q1*q2/r is.  That cannot be verified here, so it is the caller's
-        responsibility.
+        PolarMACE receives MM positions and charges and computes all ML/MM
+        electrostatics. The conventional ML charges and ML-region bonded terms
+        are removed; Lennard-Jones and MM/MM terms remain in the force field.
+        Exactly one NonbondedForce is required. CustomNonbondedForce charge
+        handling must be declared with ``customNonbondedHasCharges`` and, when
+        needed, ``customNonbondedChargeParameter``.
         """
 
         if embedding != "electrostatic":
             raise ValueError(f"Unsupported embedding type: {embedding}")
 
-        # Check that the model can actually accept MM charges and positions
-        # before touching the System, so that an unsuitable model is rejected
-        # with the System left alone rather than stripped of its ML-MM
-        # electrostatics.  This is also the first point at which the check is
-        # possible, since it needs the loaded checkpoint; the model is handed to
-        # addForces() below so the checkpoint is only read once.
+        # Validate before modifying the input system.
 
         model, device = self._loadModel(args)
         if not _supports_mm_embedding(model):
@@ -602,21 +534,9 @@ class MACEPotentialImpl(MLPotentialImpl):
             )
 
         if interpolate:
-            # At lambda_interpolate=0 the conventional endpoint would be missing
-            # the ML-MM Coulomb energy, which is removed from the conventional
-            # force field outside of the interpolating CustomCVForce and cannot
-            # be restored from within it.
             raise ValueError("Electrostatic embedding does not support interpolation.")
 
         periodic = system.usesPeriodicBoundaryConditions()
-
-        # Electrostatic embedding has to account for every Coulomb term in the
-        # force field: the ones involving the ML subset are removed here on the
-        # understanding that the model supplies them.  Anything it cannot see is
-        # either left in place and counted twice, or removed and never replaced,
-        # and in both cases the result is a wrong energy rather than an error.
-        # So refuse the cases where the electrostatics cannot be located rather
-        # than guessing.
 
         nonbondedForces = [f for f in system.getForces() if isinstance(f, openmm.NonbondedForce)]
         if len(nonbondedForces) > 1:
@@ -632,35 +552,20 @@ class MACEPotentialImpl(MLPotentialImpl):
             if customNonbondedHasCharges and customNonbondedChargeParameter is None:
                 raise ValueError("A CustomNonbondedForce includes electrostatic interactions, so customNonbondedChargeParameter must name the per-particle parameter holding the charge.")
 
-        # Create the new system with the ML-ML interactions that the model
-        # computes removed.
-
         newSystem = utilities.removeBonds(system, topology, atoms, True)
         atomSet = set(atoms)
 
         for force in newSystem.getForces():
             if isinstance(force, openmm.NonbondedForce):
 
-                # Zero the charge of every ML atom, which removes all Coulomb
-                # interactions involving the ML subset while leaving its
-                # Lennard-Jones parameters, and the MM-MM interactions,
-                # untouched.
-
                 for atom in atoms:
                     charge, sigma, epsilon = force.getParticleParameters(atom)
                     force.setParticleParameters(atom, 0.0, sigma, epsilon)
-
-                # setParticleParameters() does not update the charge products
-                # that were precomputed for existing exceptions, so the 1-4
-                # Coulomb terms crossing the ML/MM boundary have to be zeroed
-                # separately.
 
                 for index in range(force.getNumExceptions()):
                     p1, p2, chargeProd, sigma, epsilon = force.getExceptionParameters(index)
                     if p1 in atomSet or p2 in atomSet:
                         force.setExceptionParameters(index, p1, p2, 0.0, sigma, epsilon)
-
-                # Exclude the ML-ML interactions entirely.
 
                 for i in range(len(atoms)):
                     for j in range(i):
@@ -669,12 +574,6 @@ class MACEPotentialImpl(MLPotentialImpl):
                 force.setExceptionsUsePeriodicBoundaryConditions(periodic)
 
             elif isinstance(force, openmm.CustomNonbondedForce):
-
-                # Zero the named charge parameter on the ML atoms, the same
-                # trick used for the NonbondedForce above.  Unlike there it is
-                # not guaranteed to work: it removes the ML terms only if the
-                # energy expression is multiplicatively separable in the charge,
-                # as q1*q2/r is, and that cannot be checked here.
 
                 if customNonbondedChargeParameter is not None:
                     names = [force.getPerParticleParameterName(i)
@@ -688,10 +587,6 @@ class MACEPotentialImpl(MLPotentialImpl):
                         force.setParticleParameters(atom, parameters)
 
                 utilities.addCustomNonbondedExclusions(force, atoms)
-
-        # Add the ML potential, telling it that it is responsible for the
-        # electrostatic interactions with the atoms outside the ML subset, and
-        # handing over the model already loaded above.
 
         self._preloadedModel = (model, device)
         try:
