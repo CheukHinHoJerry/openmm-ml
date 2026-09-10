@@ -403,11 +403,10 @@ with the model name `mace` and a `modelPath`.  For a custom checkpoint the metho
 known until it is loaded; a non-PolarMACE checkpoint is rejected at that point rather than silently falling back to
 mechanical embedding, since the mixed system has already had its ML-MM electrostatics removed.
 
-The damped real-space and reciprocal-space ML-MM cross energy, including slab and molecule-in-box corrections, is
-implemented by `GTOElectrostaticCrossEnergy` in `graph_longrange`.  OpenMM-ML only adapts the external positions and
-charges to the stock PolarMACE electrostatic feature and energy blocks, then returns the corresponding MM forces.  The
-normalization is therefore inherited from the checkpoint's own GTO density and feature bases rather than duplicated in
-the OpenMM interface.
+The damped real-space and reciprocal-space ML-MM cross energy, including slab and molecule-in-box corrections, and the
+external-source feature and energy wrappers are implemented in `graph_longrange`. OpenMM-ML only supplies the external
+positions and charges to those blocks, then returns the corresponding MM forces. The normalization is therefore
+inherited from the checkpoint's own GTO density and feature bases rather than duplicated in the OpenMM interface.
 Interpolation is not supported, because at `lambda_interpolate=0` the ML-MM electrostatics would be missing from the MM
 endpoint.
 

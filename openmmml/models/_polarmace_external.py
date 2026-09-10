@@ -65,125 +65,6 @@ def _rebuild_energy_block(block, pbc_handling: str = "auto"):
     return rebuilt
 
 
-class _ExternalFeatureBlock:
-    """Mixin-like implementation installed around a graph feature module."""
-
-    def __init__(self, base):
-        import torch
-
-        class FeatureBlock(torch.nn.Module):
-            def __init__(inner_self, wrapped):
-                super().__init__()
-                inner_self.base = wrapped
-                inner_self._external = None
-
-            def __getattr__(inner_self, name):
-                try:
-                    return super().__getattr__(name)
-                except AttributeError:
-                    return getattr(inner_self.base, name)
-
-            def set_external_sources(inner_self, external):
-                inner_self._external = external
-
-            def precompute_geometry(inner_self, **kwargs):
-                base_kwargs = dict(kwargs)
-                base_kwargs.pop("force_pbc_evaluator", None)
-                cache = inner_self.base.precompute_geometry(**base_kwargs)
-                external = inner_self._external
-                if external is None:
-                    return cache
-                external_cache = inner_self.base.precompute_geometry_source_target(
-                    k_vectors=base_kwargs["k_vectors"],
-                    k_norm2=base_kwargs["k_norm2"],
-                    k_vector_batch=base_kwargs["k_vector_batch"],
-                    k0_mask=base_kwargs["k0_mask"],
-                    src_positions=external["positions"],
-                    src_batch=external["batch"],
-                    tgt_positions=base_kwargs["node_positions"],
-                    tgt_batch=base_kwargs["batch"],
-                    volume=base_kwargs["volume"],
-                    pbc=base_kwargs["pbc"],
-                )
-                external_field = inner_self.base.forward_dynamic_source_target(
-                    cache=external_cache,
-                    source_feats=external["features"],
-                )
-                result = dict(cache)
-                result["_openmmml_external_field"] = external_field
-                return result
-
-            def forward_dynamic(inner_self, cache, source_feats, pbc=None):
-                if source_feats.dim() == 3 and source_feats.shape[-2] == 1:
-                    source_feats = source_feats.squeeze(-2)
-                value = inner_self.base.forward_dynamic(
-                    cache=cache, source_feats=source_feats
-                )
-                external_field = cache.get("_openmmml_external_field")
-                if external_field is not None:
-                    # PolarMACE has two spin channels.  Each channel receives half
-                    # of the physical external potential.
-                    value = value + 0.5 * external_field
-                return value
-
-        self.module = FeatureBlock(base)
-
-
-class _ExternalEnergyBlock:
-    def __init__(self, base):
-        import torch
-        try:
-            from graph_longrange.external_source_energy import (
-                GTOElectrostaticCrossEnergy,
-            )
-        except ImportError as exc:
-            raise ImportError(
-                "PolarMACE electrostatic embedding requires a graph_longrange "
-                "release that provides GTOElectrostaticCrossEnergy."
-            ) from exc
-
-        class EnergyBlock(torch.nn.Module):
-            def __init__(inner_self, wrapped):
-                super().__init__()
-                inner_self.base = wrapped
-                inner_self.cross = GTOElectrostaticCrossEnergy.from_energy(wrapped)
-                inner_self._external = None
-
-            def __getattr__(inner_self, name):
-                try:
-                    return super().__getattr__(name)
-                except AttributeError:
-                    return getattr(inner_self.base, name)
-
-            def set_external_sources(inner_self, external):
-                inner_self._external = external
-
-            def forward(inner_self, **kwargs):
-                base_kwargs = dict(kwargs)
-                base_kwargs.pop("force_pbc_evaluator", None)
-                energy = inner_self.base(**base_kwargs)
-                external = inner_self._external
-                if external is None:
-                    return energy
-                cross = inner_self.cross(
-                    k_vectors=base_kwargs["k_vectors"],
-                    k_norm2=base_kwargs["k_norm2"],
-                    k_vector_batch=base_kwargs["k_vector_batch"],
-                    k0_mask=base_kwargs["k0_mask"],
-                    source_feats=base_kwargs["source_feats"],
-                    source_positions=base_kwargs["node_positions"],
-                    source_batch=base_kwargs["batch"],
-                    target_feats=external["features"],
-                    target_positions=external["positions"],
-                    target_batch=external["batch"],
-                    volume=base_kwargs["volume"],
-                    pbc=base_kwargs["pbc"],
-                )
-                return energy + cross
-
-        self.module = EnergyBlock(base)
-
-
 def _prepare_external_sources(model, data, compute_force: bool):
     import torch
 
@@ -247,10 +128,28 @@ def enable_polarmace_external_sources(model):
             f"{model.__class__.__name__}."
         )
 
+    try:
+        from graph_longrange.external_source_energy import (
+            GTOElectrostaticExternalSourceEnergy,
+        )
+        from graph_longrange.external_source_features import (
+            GTOElectrostaticExternalSourceFeatures,
+        )
+    except ImportError as exc:
+        raise ImportError(
+            "PolarMACE electrostatic embedding requires a graph_longrange "
+            "release that provides the external-source energy and feature blocks."
+        ) from exc
+
     feature_base = _rebuild_feature_block(model.electric_potential_descriptor)
     energy_base = _rebuild_energy_block(model.coulomb_energy)
-    feature_block = _ExternalFeatureBlock(feature_base).module
-    energy_block = _ExternalEnergyBlock(energy_base).module
+    feature_block = GTOElectrostaticExternalSourceFeatures.from_features(
+        feature_base,
+        # PolarMACE has two spin channels. Each receives half of the physical
+        # external potential.
+        external_scale=0.5,
+    )
+    energy_block = GTOElectrostaticExternalSourceEnergy.from_energy(energy_base)
     model.electric_potential_descriptor = feature_block
     model.coulomb_energy = energy_block
 
@@ -303,8 +202,15 @@ def enable_polarmace_external_sources(model):
                     "Cartesian forces only."
                 )
 
-            self.model.electric_potential_descriptor.set_external_sources(external)
-            self.model.coulomb_energy.set_external_sources(external)
+            external_kwargs = {
+                "external_feats": external["features"],
+                "external_positions": external["positions"],
+                "external_batch": external["batch"],
+            }
+            self.model.electric_potential_descriptor.set_external_sources(
+                **external_kwargs
+            )
+            self.model.coulomb_energy.set_external_sources(**external_kwargs)
             try:
                 result = self.model(
                     data,
@@ -339,8 +245,8 @@ def enable_polarmace_external_sources(model):
                     result["mm_forces"] = None
                 return result
             finally:
-                self.model.electric_potential_descriptor.set_external_sources(None)
-                self.model.coulomb_energy.set_external_sources(None)
+                self.model.electric_potential_descriptor.clear_external_sources()
+                self.model.coulomb_energy.clear_external_sources()
 
     return PolarMACEExternalSources(model)
 
