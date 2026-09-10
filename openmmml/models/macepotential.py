@@ -99,15 +99,11 @@ def _prepare_external_sources(model, data, compute_force: bool):
 
     positions = data.get("mm_positions")
     charges = data.get("mm_charges")
-    multipoles = data.get("mm_multipoles")
-    if charges is not None and multipoles is not None:
-        raise ValueError("mm_charges and mm_multipoles are mutually exclusive.")
-    values = multipoles if multipoles is not None else charges
     if (
         positions is None
-        or values is None
+        or charges is None
         or positions.numel() == 0
-        or values.numel() == 0
+        or charges.numel() == 0
     ):
         return None
 
@@ -115,22 +111,12 @@ def _prepare_external_sources(model, data, compute_force: bool):
     positions = positions.to(device=ml_positions.device, dtype=ml_positions.dtype)
     positions = positions.clone().requires_grad_(compute_force)
     width = (int(model.atomic_multipoles_max_l) + 1) ** 2
-    if multipoles is None:
-        features = torch.zeros(
-            (charges.numel(), width),
-            dtype=ml_positions.dtype,
-            device=ml_positions.device,
-        )
-        features[:, 0] = charges.to(features).reshape(-1)
-    else:
-        features = multipoles.to(
-            device=ml_positions.device, dtype=ml_positions.dtype
-        ).clone()
-        if features.dim() != 2 or features.shape != (positions.shape[0], width):
-            raise ValueError(f"mm_multipoles must have shape [N_mm, {width}].")
-        if width >= 4:
-            # Public Cartesian (q, px, py, pz) -> graph/e3nn (q, py, pz, px).
-            features[:, 1:4] = features[:, [2, 3, 1]]
+    features = torch.zeros(
+        (charges.numel(), width),
+        dtype=ml_positions.dtype,
+        device=ml_positions.device,
+    )
+    features[:, 0] = charges.to(features).reshape(-1)
     if positions.shape[0] != features.shape[0]:
         raise ValueError(
             "MM positions and electrostatic sources must have the same length."
