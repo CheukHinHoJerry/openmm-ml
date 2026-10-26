@@ -74,9 +74,12 @@ def _prepareExternalSources(model, data, computeForce: bool):
     return {"positions": positions, "features": features, "batch": batch}
 
 
-def _enablePolarMACEExternalSources(model):
+def _enablePolarMACEExternalSources(model, mmFieldMethod: str = "direct"):
     """Wrap PolarMACE with dynamic MM electrostatic sources in eager mode."""
     import torch
+
+    if mmFieldMethod not in ("direct", "PME"):
+        raise ValueError(f"Unsupported mmFieldMethod '{mmFieldMethod}'; use 'direct' or 'PME'.")
 
     if getattr(model, "supports_external_electrostatics", False):
         return model
@@ -108,6 +111,7 @@ def _enablePolarMACEExternalSources(model):
             # PolarMACE has two spin channels. Each receives half of the
             # physical external potential.
             external_scale=0.5,
+            method=mmFieldMethod,
         )
     )
     model.coulomb_energy = GTOElectrostaticExternalSourceEnergy.from_energy(
@@ -174,8 +178,9 @@ def _enablePolarMACEExternalSources(model):
                 "external_positions": external["positions"],
                 "external_batch": external["batch"],
             }
+            # PME reads the cell the k-vectors were built from.
             self.model.electric_potential_descriptor.set_external_sources(
-                **externalKwargs
+                **externalKwargs, cell=data["cell"].view(-1, 3, 3)
             )
             self.model.coulomb_energy.set_external_sources(**externalKwargs)
             try:
@@ -343,7 +348,7 @@ class MACEPotentialImpl(MLPotentialImpl):
         else:
             raise ValueError(f"Unsupported MACE model: {self.name}")
         if model.__class__.__name__ == "PolarMACE":
-            model = _enablePolarMACEExternalSources(model)
+            model = _enablePolarMACEExternalSources(model, args.get("mmFieldMethod", "direct"))
         return model, device
 
     def addForces(
@@ -483,6 +488,13 @@ class MACEPotentialImpl(MLPotentialImpl):
         electrostatics. The conventional ML charges and ML-region bonded terms
         are removed; Lennard-Jones and MM/MM terms remain in the force field.
         Exactly one NonbondedForce is required, and it supplies the MM charges.
+
+        In a periodic system the MM field acting on the ML atoms is evaluated
+        in reciprocal space.  ``mmFieldMethod='direct'`` (the default) sums over
+        the MM charges explicitly, whose memory grows with the box volume times
+        the number of MM atoms; ``mmFieldMethod='PME'`` spreads them onto a mesh
+        instead, which keeps large MM environments affordable and requires the
+        torch-pme package.
         """
 
         if embedding != "electrostatic":
