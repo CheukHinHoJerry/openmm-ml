@@ -441,7 +441,11 @@ class MACEPotentialImpl(MLPotentialImpl):
             mmCharges = embeddingData["mm_charges"]
         
         mlIndices = np.array(atoms) if (atoms is not None and mmIndices is not None) else None
-        periodic = (topology.getPeriodicBoxVectors() is not None) or system.usesPeriodicBoundaryConditions()
+        if useMMEmbedding:
+            # The ML/MM electrostatics must use the same boundary conditions as the MM system.
+            periodic = system.usesPeriodicBoundaryConditions()
+        else:
+            periodic = (topology.getPeriodicBoxVectors() is not None) or system.usesPeriodicBoundaryConditions()
 
         compute = partial(_computeMACE,
                           model=model,
