@@ -446,7 +446,7 @@ class MACEPotentialImpl(MLPotentialImpl):
         compute = partial(_computeMACE,
                           model=model,
                           ptr=torch.tensor([0, nodeAttrs.shape[0]], dtype=torch.long, device=modelDevice, requires_grad=False),
-                          nodeAttrs=nodeAttrs.to(dtype),
+                          node_attrs=nodeAttrs.to(dtype),
                           batch=torch.zeros(nodeAttrs.shape[0], dtype=torch.long, device=modelDevice, requires_grad=False),
                           pbc=torch.tensor([periodic, periodic, periodic], dtype=torch.bool, device=modelDevice, requires_grad=False),
                           returnEnergyType=returnEnergyType,
